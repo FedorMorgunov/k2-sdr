@@ -7,6 +7,12 @@ followup_state.json
 
 # Python
 .venv/
+.venv-build/
 venv/
 __pycache__/
 *.pyc
+
+# Сборка приложения (PyInstaller)
+build/
+dist/
+*.spec

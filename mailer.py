@@ -26,11 +26,19 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+class MailerError(Exception):
+    """Ожидаемая ошибка (неверные данные/настройки/подключение).
+
+    В CLI перехватывается в main() и печатается пользователю; в веб-интерфейсе
+    превращается в понятное сообщение об ошибке вместо падения процесса."""
+
+
 try:
     import configparser
     from openpyxl import load_workbook
 except ImportError as exc:  # pragma: no cover
-    sys.exit(f"Не хватает зависимости: {exc}. Установите: pip install -r requirements.txt")
+    raise MailerError(f"Не хватает зависимости: {exc}. Установите: pip install -r requirements.txt")
 
 
 # --------------------------------------------------------------------------- #
@@ -55,7 +63,7 @@ class ColumnMap:
 
 def load_config(path: Path) -> tuple[ExchangeConfig, ColumnMap]:
     if not path.exists():
-        sys.exit(
+        raise MailerError(
             f"Не найден файл конфигурации: {path}\n"
             f"Скопируйте пример и заполните: cp config.example.ini config.ini"
         )
@@ -65,7 +73,7 @@ def load_config(path: Path) -> tuple[ExchangeConfig, ColumnMap]:
     ex = parser["exchange"]
     email = ex.get("email", "").strip()
     if not email:
-        sys.exit("В config.ini не указан email в секции [exchange].")
+        raise MailerError("В config.ini не указан email в секции [exchange].")
 
     cfg = ExchangeConfig(
         email=email,
@@ -119,7 +127,7 @@ def _norm(value) -> str:
 
 def read_contacts(path: Path, cols: ColumnMap) -> list[Contact]:
     if not path.exists():
-        sys.exit(f"Не найден Excel-файл: {path}")
+        raise MailerError(f"Не найден Excel-файл: {path}")
 
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
@@ -128,7 +136,7 @@ def read_contacts(path: Path, cols: ColumnMap) -> list[Contact]:
     try:
         header = next(rows)
     except StopIteration:
-        sys.exit(f"Файл {path} пустой.")
+        raise MailerError(f"Файл {path} пустой.")
 
     # Заголовок -> индекс колонки (нормализованно).
     header_index = {_norm(h): i for i, h in enumerate(header) if h is not None}
@@ -137,7 +145,7 @@ def read_contacts(path: Path, cols: ColumnMap) -> list[Contact]:
         idx = header_index.get(_norm(human_name))
         if idx is None:
             available = ", ".join(str(h) for h in header if h is not None)
-            sys.exit(
+            raise MailerError(
                 f"В Excel не найдена колонка «{human_name}».\n"
                 f"Доступные колонки: {available}\n"
                 f"Поправьте заголовки в файле или раздел [columns] в config.ini."
@@ -170,7 +178,7 @@ def read_contacts(path: Path, cols: ColumnMap) -> list[Contact]:
 
     wb.close()
     if not contacts:
-        sys.exit(f"В файле {path} не найдено ни одной строки с адресом почты.")
+        raise MailerError(f"В файле {path} не найдено ни одной строки с адресом почты.")
     return contacts
 
 
@@ -190,7 +198,7 @@ def render_template(template_text: str, contact: Contact) -> str:
 
 def load_template(path: Path) -> str:
     if not path.exists():
-        sys.exit(f"Не найден файл шаблона: {path}")
+        raise MailerError(f"Не найден файл шаблона: {path}")
     return path.read_text(encoding="utf-8")
 
 
@@ -364,12 +372,12 @@ def _connect(cfg: ExchangeConfig) -> ExchangeClient:
     if not password:
         password = getpass.getpass(f"Пароль для {cfg.username}: ")
     if not password:
-        sys.exit("Пароль не введён — отмена.")
+        raise MailerError("Пароль не введён — отмена.")
     print(f"Подключение к Exchange как {cfg.email} ...")
     try:
         client = ExchangeClient(cfg, password)
     except Exception as exc:
-        sys.exit(f"Не удалось подключиться к Exchange: {exc}")
+        raise MailerError(f"Не удалось подключиться к Exchange: {exc}")
     print("Подключение установлено.\n")
     return client
 
@@ -450,7 +458,7 @@ def cmd_followup(args) -> None:
     records = load_state(state_path)
 
     if not records:
-        sys.exit(f"В {state_path} нет данных о первой рассылке. "
+        raise MailerError(f"В {state_path} нет данных о первой рассылке. "
                  f"Сначала выполните команду send.")
 
     # Кому досылаем: успешно отправленным в первой рассылке.
@@ -461,7 +469,7 @@ def cmd_followup(args) -> None:
         targets = [r for r in targets if r.email.lower() in wanted]
 
     if not targets:
-        sys.exit("Нет подходящих адресатов для повторного письма.")
+        raise MailerError("Нет подходящих адресатов для повторного письма.")
 
     if args.limit:
         targets = targets[: args.limit]
@@ -564,7 +572,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except MailerError as exc:
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":
