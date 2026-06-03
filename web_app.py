@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import html as htmllib
 import os
 import threading
 import time
@@ -27,7 +28,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, abort
 
 import mailer
 from mailer import (
@@ -94,6 +95,65 @@ def default_template(kind: str) -> str:
     if saved.exists():
         return saved.read_text(encoding="utf-8")
     return DEFAULT_LETTER if kind == "letter" else DEFAULT_FOLLOWUP
+
+
+# --------------------------------------------------------------------------- #
+# Подпись (HTML) и фото для неё. Хранятся локально => у каждого сотрудника своя.
+# --------------------------------------------------------------------------- #
+PHOTO_CID = "sigphoto"
+PHOTO_STEM = "signature_photo"
+
+
+def signature_file() -> Path:
+    return workdir() / "signature.html"
+
+
+def read_signature() -> str:
+    f = signature_file()
+    return f.read_text(encoding="utf-8") if f.exists() else ""
+
+
+def photo_path() -> Path | None:
+    for p in workdir().glob(PHOTO_STEM + ".*"):
+        return p
+    return None
+
+
+def text_to_html(text: str) -> str:
+    """Переводит обычный текст письма в безопасный HTML с переносами строк."""
+    esc = htmllib.escape(text)
+    return ('<div style="font-family:Calibri,Arial,sans-serif;font-size:14px;'
+            'color:#222;line-height:1.5;">' + esc.replace("\n", "<br>") + "</div>")
+
+
+def build_email_html(rendered_body: str, photo_ref: str, signature=None) -> str:
+    """Собирает HTML письма: текст письма + HTML-подпись.
+
+    signature — текст подписи; если None, берётся сохранённая (для предпросмотра
+    передаём текущее содержимое поля, чтобы видеть несохранённые правки).
+    photo_ref подставляется вместо токена {photo} в подписи:
+      * при отправке  — 'cid:sigphoto' (картинка вложена в письмо);
+      * в предпросмотре — URL '/api/sigphoto' (видно в браузере).
+    """
+    parts = [text_to_html(rendered_body)]
+    sig = (read_signature() if signature is None else signature).strip()
+    if sig:
+        parts.append("<br>" + sig.replace("{photo}", photo_ref or ""))
+    return ("<html><body style=\"margin:0;padding:0;\">"
+            + "".join(parts) + "</body></html>")
+
+
+def signature_active() -> bool:
+    return bool(read_signature().strip())
+
+
+def inline_photo_for_send():
+    """Возвращает (имя, байты, cid) если подпись использует {photo} и фото есть."""
+    sig = read_signature()
+    p = photo_path()
+    if p and "{photo}" in sig:
+        return (p.name, p.read_bytes(), PHOTO_CID)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +255,9 @@ def worker_send(template: str, delay: float, limit: int, resume: bool) -> None:
             body = render_template(template, c)
             subject = c.subject or "(без темы)"
             try:
-                mid, conv = client.send_new(c.email, subject, body)
+                html = build_email_html(body, "cid:" + PHOTO_CID) if signature_active() else ""
+                mid, conv = client.send_new(c.email, subject, body,
+                                            html_body=html, inline_image=inline_photo_for_send())
                 upsert_state(records, SentRecord(
                     email=c.email, name=c.name, company=c.company, subject=subject,
                     status="sent", internet_message_id=mid, conversation_id=conv,
@@ -262,8 +324,10 @@ def worker_followup(template: str, delay: float, limit: int, only: str) -> None:
         for i, r in enumerate(targets, start=1):
             body = render_template(template, r.context_contact())
             try:
+                html = build_email_html(body, "cid:" + PHOTO_CID) if signature_active() else ""
                 client.send_followup(r.email, r.subject, body,
-                                     in_reply_to=r.internet_message_id)
+                                     in_reply_to=r.internet_message_id,
+                                     html_body=html, inline_image=inline_photo_for_send())
                 with JOB_LOCK:
                     JOB["sent"] += 1
                 job_log(f"✓ [{i}/{len(targets)}] {r.email} — дослано в ту же ветку")
@@ -328,6 +392,9 @@ def api_get_config():
                     "email": cols.email, "subject": cols.subject},
         "letter": default_template("letter"),
         "followup": default_template("followup"),
+        "signature": read_signature(),
+        "has_photo": photo_path() is not None,
+        "photo_name": photo_path().name if photo_path() else "",
         "has_password": bool(SESSION["password"]),
         "contacts_count": len(SESSION["contacts"]),
         "sent_count": sent,
@@ -411,12 +478,53 @@ def api_save_templates():
     return jsonify({"ok": True})
 
 
+@app.post("/api/save_signature")
+def api_save_signature():
+    data = request.get_json(force=True)
+    signature_file().write_text(data.get("signature", ""), encoding="utf-8")
+    return jsonify({"ok": True})
+
+
+ALLOWED_PHOTO_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+
+
+@app.post("/api/upload_photo")
+def api_upload_photo():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"ok": False, "error": "Файл не выбран."}), 400
+    f = request.files["file"]
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ALLOWED_PHOTO_EXT:
+        return jsonify({"ok": False, "error": "Допустимы только изображения (png, jpg, gif, bmp)."}), 400
+    # удаляем прежнее фото (любого расширения), сохраняем новое
+    for old in workdir().glob(PHOTO_STEM + ".*"):
+        old.unlink()
+    f.save(workdir() / (PHOTO_STEM + ext))
+    return jsonify({"ok": True, "name": PHOTO_STEM + ext})
+
+
+@app.post("/api/delete_photo")
+def api_delete_photo():
+    for old in workdir().glob(PHOTO_STEM + ".*"):
+        old.unlink()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/sigphoto")
+def api_sigphoto():
+    p = photo_path()
+    if not p:
+        abort(404)
+    return send_file(p)
+
+
 @app.post("/api/preview")
 def api_preview():
     data = request.get_json(force=True)
     template = data.get("template", "")
     which = data.get("which", "letter")
-    count = int(data.get("count", 3))
+    signature = data.get("signature")  # текущее содержимое поля подписи
+    count = int(data.get("count", 1))
 
     if which == "followup":
         records = [r for r in load_state(state_file()) if r.status == "sent"]
@@ -433,8 +541,9 @@ def api_preview():
         subject = c.subject or "(без темы)"
         if which == "followup" and not subject.lower().startswith("re:"):
             subject = f"RE: {subject}"
-        result.append({"email": c.email, "subject": subject,
-                       "body": render_template(template, c)})
+        body = render_template(template, c)
+        html = build_email_html(body, "/api/sigphoto", signature=signature)
+        result.append({"email": c.email, "subject": subject, "html": html})
     return jsonify({"ok": True, "items": result})
 
 
@@ -525,6 +634,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
              margin-top:8px; }
   .preview .subj { font-weight:600; }
   .preview pre { white-space:pre-wrap; margin:6px 0 0; font-size:13px; }
+  .mailhtml { background:#fff; border:1px dashed #cbd5e0; border-radius:6px; padding:12px; margin-top:8px; }
+  .mailhtml img { max-width:100%; height:auto; }
   code { background:#eef2f7; padding:1px 5px; border-radius:4px; }
 </style>
 </head>
@@ -587,6 +698,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div id="previewBox"></div>
   </div>
 
+  <!-- Подпись -->
+  <div class="card">
+    <h2><span class="step">✍</span> Корпоративная подпись с фото</h2>
+    <div class="hint">Вставьте готовый HTML-код подписи. Где должно быть фото — впишите
+      <code>{photo}</code> в адрес картинки, например:
+      <code>&lt;img src="{photo}" width="120"&gt;</code>. Фото встроится прямо в письмо.</div>
+    <label>HTML-код подписи</label>
+    <textarea id="signature" placeholder='&lt;table&gt;&lt;tr&gt;
+  &lt;td&gt;&lt;img src="{photo}" width="110" style="border-radius:8px"&gt;&lt;/td&gt;
+  &lt;td style="padding-left:14px;font-family:Arial"&gt;
+    &lt;b&gt;Фёдор Моргунов&lt;/b&gt;&lt;br&gt;Менеджер, K2 SDR&lt;br&gt;
+    +7 999 000-00-00 &amp;middot; fmorgunov@k2.cloud
+  &lt;/td&gt;
+&lt;/tr&gt;&lt;/table&gt;'></textarea>
+    <div class="btns">
+      <input id="photofile" type="file" accept="image/*">
+      <button id="btnUploadPhoto" class="secondary">Загрузить фото</button>
+      <button id="btnDeletePhoto" class="secondary">Убрать фото</button>
+      <span id="photoPill" class="pill">фото не загружено</span>
+      <button id="btnSaveSig" class="secondary">Сохранить подпись</button>
+    </div>
+    <div id="sigMsg" class="msg"></div>
+  </div>
+
   <!-- 4. Отправка -->
   <div class="card">
     <h2><span class="step">4</span> Отправка</h2>
@@ -630,6 +765,8 @@ async function loadConfig(){
   $('ews_url').value = c.ews_url || ''; $('auth_type').value = c.auth_type || 'NTLM';
   $('verify_ssl').checked = c.verify_ssl !== false;
   $('letter').value = c.letter || ''; $('followup').value = c.followup || '';
+  $('signature').value = c.signature || '';
+  setPhotoPill(c.has_photo, c.photo_name);
   $('contactsPill').textContent = c.contacts_count ? (c.contacts_count + ' контактов') : 'не загружено';
   $('workdir').textContent = 'Данные и история хранятся в папке: ' + c.workdir;
   if (c.sent_count) setMsg($('jobStatus'), 'В истории отправки: ' + c.sent_count + ' получателей (доступно «дослать»).', true);
@@ -662,13 +799,37 @@ $('btnSaveTpl').onclick = async () => {
   setMsg($('jobStatus'), 'Шаблоны сохранены.', true);
 };
 
+function setPhotoPill(has, name){
+  $('photoPill').textContent = has ? ('фото: ' + (name || 'загружено')) : 'фото не загружено';
+}
+
+$('btnSaveSig').onclick = async () => {
+  await postJSON('/api/save_signature', {signature: $('signature').value});
+  setMsg($('sigMsg'), 'Подпись сохранена.', true);
+};
+
+$('btnUploadPhoto').onclick = async () => {
+  const f = $('photofile').files[0];
+  if (!f){ setMsg($('sigMsg'), 'Выберите файл изображения.', false); return; }
+  const fd = new FormData(); fd.append('file', f);
+  const r = await api('/api/upload_photo', {method:'POST', body: fd});
+  if (!r.ok){ setMsg($('sigMsg'), 'Ошибка: ' + r.error, false); return; }
+  setPhotoPill(true, r.name); setMsg($('sigMsg'), 'Фото загружено.', true);
+};
+
+$('btnDeletePhoto').onclick = async () => {
+  await postJSON('/api/delete_photo', {});
+  setPhotoPill(false, ''); setMsg($('sigMsg'), 'Фото убрано.', true);
+};
+
 async function preview(which){
   const template = which === 'followup' ? $('followup').value : $('letter').value;
-  const r = await postJSON('/api/preview', {template, which, count: 3});
+  const r = await postJSON('/api/preview', {template, which, signature: $('signature').value, count: 1});
   if (!r.ok){ $('previewBox').innerHTML = `<div class="msg err">${esc(r.error)}</div>`; return; }
   let h = '';
   for (const it of r.items)
-    h += `<div class="preview"><div class="subj">${esc(it.email)} — ${esc(it.subject)}</div><pre>${esc(it.body)}</pre></div>`;
+    h += `<div class="preview"><div class="subj">${esc(it.email)} — ${esc(it.subject)}</div>`
+       + `<div class="mailhtml">${it.html}</div></div>`;
   $('previewBox').innerHTML = h;
 }
 $('btnPreviewLetter').onclick = () => preview('letter');
@@ -696,6 +857,7 @@ function setButtons(running){
 $('btnSend').onclick = async () => {
   if (!confirm('Отправить рассылку всем загруженным контактам?')) return;
   await postJSON('/api/save_settings', collectConn());
+  await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/send', {
     template: $('letter').value, delay: +$('delay').value,
     limit: +$('limit').value, resume: $('resume').checked,
@@ -707,6 +869,7 @@ $('btnSend').onclick = async () => {
 $('btnFollow').onclick = async () => {
   if (!confirm('Дослать повторное письмо в ту же ветку (тем, кому уже отправляли)?')) return;
   await postJSON('/api/save_settings', collectConn());
+  await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/followup', {
     template: $('followup').value, delay: +$('delay').value, limit: +$('limit').value, only: '',
   });

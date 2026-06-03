@@ -285,59 +285,61 @@ class ExchangeClient:
                 access_type=DELEGATE,
             )
 
-    def send_new(self, to_email: str, subject: str, body: str) -> tuple[str, str]:
+    def send_new(self, to_email: str, subject: str, body: str,
+                 html_body: str = "", inline_image=None) -> tuple[str, str]:
         """Отправляет новое письмо и сохраняет копию в «Отправленные».
-        Возвращает (internet_message_id, conversation_id) для будущих ответов."""
-        from exchangelib import Message, Mailbox
 
-        msg = Message(
-            account=self.account,
-            subject=subject,
-            body=body,  # обычный текст
-            to_recipients=[Mailbox(email_address=to_email)],
-        )
+        Если задан html_body — письмо уходит как HTML (нужно для подписи с фото).
+        inline_image — кортеж (имя_файла, байты, content_id) для встроенной картинки.
+        Возвращает (internet_message_id, conversation_id) для будущих ответов."""
+        msg = self._build_message(subject, body, html_body, [to_email], inline_image)
         msg.send_and_save()
         return self._read_thread_ids(msg, subject, to_email)
 
     def send_followup(self, to_email: str, subject: str, body: str,
-                      in_reply_to: str) -> tuple[str, str]:
+                      in_reply_to: str, html_body: str = "",
+                      inline_image=None) -> tuple[str, str]:
         """Отправляет повторное письмо в ту же ветку.
 
         Связка ветки достигается двумя способами одновременно:
           1) одинаковая тема разговора (Outlook группирует по теме);
           2) заголовки In-Reply-To / References на исходное письмо (RFC-стандарт).
         """
-        from exchangelib import Message, Mailbox
-
         reply_subject = subject if subject.lower().startswith("re:") else f"RE: {subject}"
 
-        kwargs = dict(
-            account=self.account,
-            subject=reply_subject,
-            body=body,
-            to_recipients=[Mailbox(email_address=to_email)],
-        )
-        if in_reply_to:
-            kwargs["in_reply_to"] = in_reply_to
-            kwargs["references"] = in_reply_to
-
-        msg = Message(**kwargs)
+        headers = {"in_reply_to": in_reply_to, "references": in_reply_to} if in_reply_to else {}
+        msg = self._build_message(reply_subject, body, html_body, [to_email],
+                                  inline_image, **headers)
         try:
             msg.send_and_save()
         except Exception:
             # Если сервер не принял заголовки треда — повторяем без них,
             # тред всё равно сложится по одинаковой теме разговора.
             if in_reply_to:
-                msg = Message(
-                    account=self.account,
-                    subject=reply_subject,
-                    body=body,
-                    to_recipients=[Mailbox(email_address=to_email)],
-                )
+                msg = self._build_message(reply_subject, body, html_body,
+                                          [to_email], inline_image)
                 msg.send_and_save()
             else:
                 raise
         return self._read_thread_ids(msg, reply_subject, to_email)
+
+    def _build_message(self, subject: str, body: str, html_body: str,
+                       recipients: list[str], inline_image=None, **headers):
+        """Собирает Message: HTML или обычный текст, при наличии — с inline-картинкой."""
+        from exchangelib import Message, Mailbox, HTMLBody, FileAttachment
+
+        msg = Message(
+            account=self.account,
+            subject=subject,
+            body=HTMLBody(html_body) if html_body else body,
+            to_recipients=[Mailbox(email_address=e) for e in recipients],
+            **headers,
+        )
+        if inline_image:
+            name, content, cid = inline_image
+            msg.attach(FileAttachment(name=name, content=content,
+                                      is_inline=True, content_id=cid))
+        return msg
 
     @staticmethod
     def _extract(msg) -> tuple[str, str]:
