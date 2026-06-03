@@ -580,6 +580,54 @@ def api_status():
 
 
 # --------------------------------------------------------------------------- #
+# Корректное завершение: кнопка «Выход» + авто-остановка при закрытии браузера
+# --------------------------------------------------------------------------- #
+# Страница раз в несколько секунд шлёт «пинг». Если пингов нет дольше таймаута
+# (браузер закрыли) и сейчас не идёт рассылка — приложение само завершается.
+HEARTBEAT_TIMEOUT = float(os.environ.get("K2_MAILER_IDLE_TIMEOUT", "15"))
+LAST_BEAT = {"t": None}  # None = браузер ещё ни разу не подключался
+
+
+@app.post("/api/heartbeat")
+def api_heartbeat():
+    LAST_BEAT["t"] = time.time()
+    return jsonify({"ok": True})
+
+
+def shutdown_now() -> None:
+    """Завершает процесс приложения (вместе с локальным сервером)."""
+    def _exit():
+        time.sleep(0.4)  # дать отдать HTTP-ответ
+        os._exit(0)
+    threading.Thread(target=_exit, daemon=True).start()
+
+
+@app.post("/api/quit")
+def api_quit():
+    shutdown_now()
+    return jsonify({"ok": True})
+
+
+def should_shutdown() -> bool:
+    """True, если браузер уже подключался, но давно молчит, и рассылка не идёт."""
+    last = LAST_BEAT["t"]
+    if last is None:
+        return False  # браузер ещё не подключался — не выключаемся
+    with JOB_LOCK:
+        if JOB["running"]:
+            return False  # идёт рассылка — не прерываем
+    return (time.time() - last) > HEARTBEAT_TIMEOUT
+
+
+def watchdog() -> None:
+    while True:
+        time.sleep(5)
+        if should_shutdown():
+            shutdown_now()
+            return
+
+
+# --------------------------------------------------------------------------- #
 # Страница (одностраничное приложение, без внешних ресурсов/CDN)
 # --------------------------------------------------------------------------- #
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -741,6 +789,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="hint" id="workdir"></div>
+  <div class="btns" style="margin-top:8px">
+    <button id="btnQuit" class="danger">Завершить работу</button>
+    <span class="hint" style="align-self:center">Сервер также сам остановится, если закрыть это окно браузера.</span>
+  </div>
 </main>
 
 <script>
@@ -878,6 +930,18 @@ $('btnFollow').onclick = async () => {
 };
 
 function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// «Пульс»: пока окно открыто, сервер живёт. Закрыли — сам остановится.
+function beat(){ fetch('/api/heartbeat', {method:'POST'}).catch(()=>{}); }
+beat(); setInterval(beat, 5000);
+
+$('btnQuit').onclick = async () => {
+  if (!confirm('Завершить работу приложения? Локальный сервер остановится.')) return;
+  try { await fetch('/api/quit', {method:'POST'}); } catch(e){}
+  document.body.innerHTML = '<div style="padding:48px;font:16px -apple-system,sans-serif;color:#2d3748">'
+    + 'Приложение остановлено. Эту вкладку можно закрыть.</div>';
+};
+
 loadConfig();
 </script>
 </body>
@@ -897,6 +961,7 @@ def main() -> None:
     print(f"{APP_NAME} запущен. Откройте в браузере: http://{HOST}:{PORT}")
     print(f"Рабочая папка: {workdir()}")
     threading.Thread(target=open_browser_later, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
     app.run(host=HOST, port=PORT, threaded=True)
 
 
