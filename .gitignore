@@ -1,0 +1,12 @@
+# Личные данные и секреты — не коммитим
+config.ini
+*.xlsx
+sent_state.json
+followup_state.json
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
