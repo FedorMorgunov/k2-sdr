@@ -21,9 +21,14 @@
 from __future__ import annotations
 
 import html as htmllib
+import logging
 import os
+import socket
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -949,20 +954,67 @@ loadConfig();
 """
 
 
-def open_browser_later() -> None:
-    time.sleep(1.0)
+def pick_free_port(preferred: int) -> int:
+    """Возвращает свободный порт, начиная с preferred (вдруг старый экземпляр висит)."""
+    for port in [preferred, *range(preferred + 1, preferred + 50)]:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((HOST, port))
+                return port
+            except OSError:
+                continue
+    return preferred
+
+
+def wait_and_open(url: str) -> None:
+    """Ждёт, пока сервер начнёт отвечать, затем открывает браузер."""
+    for _ in range(50):  # до ~10 секунд
+        try:
+            urllib.request.urlopen(url, timeout=1).read()
+            break
+        except Exception:
+            time.sleep(0.2)
     try:
-        webbrowser.open(f"http://{HOST}:{PORT}")
+        webbrowser.open(url)
+    except Exception:
+        logging.exception("не удалось открыть браузер")
+
+
+def show_error_dialog(message: str) -> None:
+    """Показывает нативное окно с ошибкой (чтобы сбой не выглядел как «ничего не происходит»)."""
+    if sys.platform != "darwin":
+        return
+    safe = message.replace('"', "'").replace("\\", "/")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display dialog "{safe}" with title "K2 Mailer" buttons {{"OK"}} with icon stop'],
+            check=False,
+        )
     except Exception:
         pass
 
 
 def main() -> None:
-    print(f"{APP_NAME} запущен. Откройте в браузере: http://{HOST}:{PORT}")
-    print(f"Рабочая папка: {workdir()}")
-    threading.Thread(target=open_browser_later, daemon=True).start()
-    threading.Thread(target=watchdog, daemon=True).start()
-    app.run(host=HOST, port=PORT, threaded=True)
+    logfile = workdir() / "app.log"
+    logging.basicConfig(
+        filename=str(logfile), level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    try:
+        global PORT
+        PORT = pick_free_port(PORT)
+        url = f"http://{HOST}:{PORT}"
+        logging.info("Запуск %s (рабочая папка %s)", url, workdir())
+        print(f"{APP_NAME} запущен. Откройте в браузере: {url}")
+        print(f"Рабочая папка: {workdir()}")
+        threading.Thread(target=wait_and_open, args=(url,), daemon=True).start()
+        threading.Thread(target=watchdog, daemon=True).start()
+        app.run(host=HOST, port=PORT, threaded=True)
+    except Exception as exc:
+        logging.exception("Сбой при запуске")
+        show_error_dialog(f"Не удалось запустить K2 Mailer:\n{exc}\n\nПодробности в файле:\n{logfile}")
+        raise
 
 
 if __name__ == "__main__":
