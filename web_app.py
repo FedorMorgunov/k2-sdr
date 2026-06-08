@@ -53,20 +53,37 @@ APP_NAME = "K2 Mailer"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("K2_MAILER_PORT", "8765"))
 
+# Шаблоны-«открывашки». Могут содержать HTML-разметку (жирный/курсив/подчёркивание,
+# абзацы) — она сохраняется в письме. Переменные {имя}/{компания} подставляются как
+# обычно. Если в шаблоне нет HTML-тегов, текст уходит как обычный (с переносами строк).
 DEFAULT_LETTER = (
-    "Здравствуйте, {имя}!\n\n"
-    "Меня зовут Фёдор, я представляю компанию K2 SDR. Обращаюсь к вам как к\n"
-    "представителю компании «{компания}».\n\n"
-    "Будет здорово обсудить, насколько наше предложение актуально для вас —\n"
-    "для этого достаточно короткого звонка на 15 минут.\n\n"
-    "С уважением,\nФёдор Моргунов\nK2 SDR\n"
+    "<p>{имя}, добрый день!</p>\n"
+    "<p>В последние 5 лет мы помогаем многим фармкомпаниям создать и разместить "
+    "сайт в России. Мы обратили внимание, что сайт компании {компания} "
+    "<u>размещен не в РФ</u>. Данные о размещении сайта являются публичными, что "
+    "создает риск несоответствия требованиям ФЗ-152 «О персональных данных». Наши "
+    "заказчики отмечают, что РКН проводит автоматизированные проверки с помощью ИИ "
+    "без предварительного уведомления, штрафы за нарушение могут достигать 4 млн "
+    "рублей.</p>\n"
+    "<p>Мы предлагаем решение задачи по размещению сайта на территории РФ «под ключ», "
+    "которое <i><u>полностью снимает риск штрафов</u></i>. Наша команда создаст сайт, "
+    "визуально не отличающийся от текущего, при этом размещенном в российском ЦОДе, "
+    "<b>соответствующем требованиям 152-ФЗ</b>.</p>\n"
+    "<p>Мы решили задачу с размещением сайтов для более десятка иностранных "
+    "фармкомпаний: порталы для личных кабинетов врачей, сайты-визитки, продуктовые "
+    "лендинги. В некоторых случаях мы решали задачу локализации сайта, когда "
+    "заказчик уже получал уведомление от РКН.</p>\n"
+    "<p>Предлагаем показать референсы и рассказать про риски по 152-ФЗ с приглашенным "
+    "юристом. Готовы ли Вы обсудить задачу локализации?</p>\n"
 )
 DEFAULT_FOLLOWUP = (
-    "Здравствуйте, {имя}!\n\n"
-    "Возвращаюсь к своему предыдущему письму — возможно, оно затерялось в потоке.\n"
-    "Всё ещё считаю, что наше предложение может быть полезно «{компания}».\n\n"
-    "Подскажите, есть ли интерес обсудить детали?\n\n"
-    "С уважением,\nФёдор Моргунов\nK2 SDR\n"
+    "<p>{имя}, здравствуйте!</p>\n"
+    "<p>Возможно, предыдущее письмо затерялось. Коротко дополню: мы реализуем "
+    "подобные проекты по локализации и размещению сайтов в российском ЦОДе в "
+    "течение ~<b>1</b> месяца.</p>\n"
+    "<p>Подробное описание нашего предложения, этапов работ, референсы и условия "
+    "размещения описаны в презентации.</p>\n"
+    "<p>Подскажите, актуальна ли задача по локализации вашего сайта?</p>\n"
 )
 
 
@@ -124,11 +141,31 @@ def photo_path() -> Path | None:
     return None
 
 
+import re as _re
+
+# Признак того, что шаблон уже содержит HTML-разметку (тогда не экранируем).
+# Тег должен идти сразу после "<" или "</" и завершаться пробелом, "/" или ">",
+# чтобы обычный текст вроде "a < b" не принимался за HTML.
+_HTML_TAG_RE = _re.compile(
+    r"</?(?:p|br|b|i|u|em|strong|div|span|ul|ol|li|a|table|tr|td|h[1-6]|blockquote)(?:\s|/|>)",
+    _re.IGNORECASE,
+)
+
+
+def looks_like_html(text: str) -> bool:
+    return bool(_HTML_TAG_RE.search(text or ""))
+
+
 def text_to_html(text: str) -> str:
-    """Переводит обычный текст письма в безопасный HTML с переносами строк."""
-    esc = htmllib.escape(text)
+    """Готовит тело письма в HTML.
+
+    Если в шаблоне есть HTML-разметку (абзацы, <b>/<i>/<u> и т.п.) — используем
+    как есть, чтобы сохранить форматирование «открывашек». Если это обычный
+    текст — экранируем и переносы строк превращаем в <br>.
+    """
+    inner = text if looks_like_html(text) else htmllib.escape(text).replace("\n", "<br>")
     return ('<div style="font-family:Calibri,Arial,sans-serif;font-size:14px;'
-            'color:#222;line-height:1.5;">' + esc.replace("\n", "<br>") + "</div>")
+            'color:#222;line-height:1.5;">' + inner + "</div>")
 
 
 def build_email_html(rendered_body: str, photo_ref: str, signature=None) -> str:
@@ -159,6 +196,34 @@ def inline_photo_for_send():
     if p and "{photo}" in sig:
         return (p.name, p.read_bytes(), PHOTO_CID)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Вложение для повторного письма (например, презентация в PDF).
+# Хранится локально; оригинальное имя файла — в connection.json.
+# --------------------------------------------------------------------------- #
+ATTACH_STEM = "followup_attachment"
+
+
+def attachment_path() -> Path | None:
+    for p in workdir().glob(ATTACH_STEM + ".*"):
+        return p
+    return None
+
+
+def attachment_display_name() -> str:
+    p = attachment_path()
+    if not p:
+        return ""
+    return read_conn().get("attachment_name") or p.name
+
+
+def attachment_for_send():
+    """Возвращает [(имя, байты)] для отправки или None, если вложения нет."""
+    p = attachment_path()
+    if not p:
+        return None
+    return [(attachment_display_name(), p.read_bytes())]
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +325,7 @@ def worker_send(template: str, delay: float, limit: int, resume: bool) -> None:
             body = render_template(template, c)
             subject = c.subject or "(без темы)"
             try:
-                html = build_email_html(body, "cid:" + PHOTO_CID) if signature_active() else ""
+                html = build_email_html(body, "cid:" + PHOTO_CID)
                 mid, conv = client.send_new(c.email, subject, body,
                                             html_body=html, inline_image=inline_photo_for_send())
                 upsert_state(records, SentRecord(
@@ -301,7 +366,8 @@ def worker_send(template: str, delay: float, limit: int, resume: bool) -> None:
             JOB["finished"] = True
 
 
-def worker_followup(template: str, delay: float, limit: int, only: str) -> None:
+def worker_followup(template: str, delay: float, limit: int, only: str,
+                    skip_done: bool = True) -> None:
     try:
         cfg = current_config()
         if not SESSION["password"]:
@@ -315,24 +381,47 @@ def worker_followup(template: str, delay: float, limit: int, only: str) -> None:
         if only.strip():
             wanted = {e.strip().lower() for e in only.split(",") if e.strip()}
             targets = [r for r in targets if r.email.lower() in wanted]
+        # Защита от случайной повторной досылки: пропускаем тех, кому повторное
+        # письмо уже уходило (отметка хранится в sent_state.json — то есть «глобально»,
+        # а не только в рамках текущей сессии приложения).
+        if skip_done:
+            before = len(targets)
+            targets = [r for r in targets if r.followup_status != "sent"]
+            skipped = before - len(targets)
+            if skipped:
+                job_log(f"Пропущено уже досланных (им повторное письмо уже уходило): {skipped}")
         if not targets:
-            raise MailerError("Нет подходящих адресатов для повторного письма.")
+            raise MailerError("Нет адресатов для повторного письма: либо нет успешной "
+                              "первой рассылки, либо всем уже дослали. Чтобы отправить "
+                              "повторно намеренно — снимите галочку «Не досылать повторно».")
         if limit > 0:
             targets = targets[:limit]
+
+        attachments = attachment_for_send()
 
         with JOB_LOCK:
             JOB["total"] = len(targets)
         job_log(f"Подключение к Exchange как {cfg.email} …")
         client = ExchangeClient(cfg, SESSION["password"])
+        if attachments:
+            job_log(f"К повторному письму прикреплено вложение: {attachments[0][0]}")
         job_log("Подключение установлено. Досылаю письма в ту же ветку.")
 
         for i, r in enumerate(targets, start=1):
             body = render_template(template, r.context_contact())
             try:
-                html = build_email_html(body, "cid:" + PHOTO_CID) if signature_active() else ""
-                client.send_followup(r.email, r.subject, body,
-                                     in_reply_to=r.internet_message_id,
-                                     html_body=html, inline_image=inline_photo_for_send())
+                html = build_email_html(body, "cid:" + PHOTO_CID)
+                new_id, _conv = client.send_followup(
+                    r.email, r.subject, body,
+                    in_reply_to=r.internet_message_id,
+                    html_body=html, inline_image=inline_photo_for_send(),
+                    attachments=attachments,
+                )
+                # Помечаем в состоянии, что повторное письмо ушло (чтобы не выслать снова).
+                r.followup_status = "sent"
+                r.followup_message_id = new_id
+                r.followup_at = _now_iso()
+                save_state(state_file(), records)
                 with JOB_LOCK:
                     JOB["sent"] += 1
                 job_log(f"✓ [{i}/{len(targets)}] {r.email} — дослано в ту же ветку")
@@ -387,6 +476,7 @@ def api_get_config():
     cols = current_cols()
     records = load_state(state_file())
     sent = sum(1 for r in records if r.status == "sent")
+    followed = sum(1 for r in records if r.status == "sent" and r.followup_status == "sent")
     return jsonify({
         "email": d.get("email", ""),
         "username": d.get("username", ""),
@@ -400,9 +490,12 @@ def api_get_config():
         "signature": read_signature(),
         "has_photo": photo_path() is not None,
         "photo_name": photo_path().name if photo_path() else "",
+        "has_attachment": attachment_path() is not None,
+        "attachment_name": attachment_display_name(),
         "has_password": bool(SESSION["password"]),
         "contacts_count": len(SESSION["contacts"]),
         "sent_count": sent,
+        "followed_count": followed,
         "workdir": str(workdir()),
     })
 
@@ -523,6 +616,37 @@ def api_sigphoto():
     return send_file(p)
 
 
+ALLOWED_ATTACH_EXT = {".pdf"}
+
+
+@app.post("/api/upload_attachment")
+def api_upload_attachment():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"ok": False, "error": "Файл не выбран."}), 400
+    f = request.files["file"]
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ALLOWED_ATTACH_EXT:
+        return jsonify({"ok": False, "error": "Допустим только файл PDF."}), 400
+    # удаляем прежнее вложение (любого расширения), сохраняем новое
+    for old in workdir().glob(ATTACH_STEM + ".*"):
+        old.unlink()
+    f.save(workdir() / (ATTACH_STEM + ext))
+    conn = read_conn()
+    conn["attachment_name"] = os.path.basename(f.filename)
+    write_conn(conn)
+    return jsonify({"ok": True, "name": os.path.basename(f.filename)})
+
+
+@app.post("/api/delete_attachment")
+def api_delete_attachment():
+    for old in workdir().glob(ATTACH_STEM + ".*"):
+        old.unlink()
+    conn = read_conn()
+    conn.pop("attachment_name", None)
+    write_conn(conn)
+    return jsonify({"ok": True})
+
+
 @app.post("/api/preview")
 def api_preview():
     data = request.get_json(force=True)
@@ -573,7 +697,8 @@ def api_followup():
     delay = float(data.get("delay", 1.0))
     limit = int(data.get("limit", 0))
     only = data.get("only", "")
-    if start_job(worker_followup, template, delay, limit, only):
+    skip_done = bool(data.get("skip_done", True))
+    if start_job(worker_followup, template, delay, limit, only, skip_done):
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "Уже выполняется другая задача."}), 409
 
@@ -738,11 +863,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <!-- 3. Шаблоны -->
   <div class="card">
     <h2><span class="step">3</span> Шаблоны писем</h2>
-    <div class="hint">Переменные: <code>{имя}</code> и <code>{компания}</code> (можно <code>{name}</code>/<code>{company}</code>).</div>
+    <div class="hint">Переменные: <code>{имя}</code> и <code>{компания}</code> (можно <code>{name}</code>/<code>{company}</code>).
+      Поддерживается HTML-форматирование: <code>&lt;b&gt;жирный&lt;/b&gt;</code>,
+      <code>&lt;i&gt;курсив&lt;/i&gt;</code>, <code>&lt;u&gt;подчёркнутый&lt;/u&gt;</code>,
+      абзацы <code>&lt;p&gt;…&lt;/p&gt;</code>. Нажмите «Предпросмотр», чтобы увидеть письмо целиком.</div>
     <label>Текст первого письма</label>
     <textarea id="letter"></textarea>
     <label style="margin-top:12px">Текст повторного письма (в ту же ветку)</label>
     <textarea id="followup"></textarea>
+    <label style="margin-top:12px">PDF-вложение для повторного письма (например, презентация)</label>
+    <div class="btns">
+      <input id="attachfile" type="file" accept="application/pdf,.pdf">
+      <button id="btnUploadAttach" class="secondary">Прикрепить PDF</button>
+      <button id="btnDeleteAttach" class="secondary">Убрать PDF</button>
+      <span id="attachPill" class="pill">PDF не прикреплён</span>
+    </div>
+    <div id="attachMsg" class="msg"></div>
     <div class="btns">
       <button class="secondary" id="btnPreviewLetter">Предпросмотр первого</button>
       <button class="secondary" id="btnPreviewFollow">Предпросмотр повторного</button>
@@ -783,11 +919,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div style="max-width:170px"><label>Лимит (0 = все)</label><input id="limit" type="number" value="0" min="0"></div>
     </div>
     <div class="inline"><input id="resume" type="checkbox" checked><label style="margin:0">Пропускать уже отправленные (для рассылки)</label></div>
+    <div class="inline"><input id="skipdone" type="checkbox" checked><label style="margin:0">Не досылать повторно тем, кому уже дослали (защита от двойной отправки)</label></div>
     <div class="btns">
       <button id="btnSend">Отправить рассылку</button>
       <button id="btnFollow" class="secondary">Дослать в ту же ветку</button>
     </div>
-    <div class="hint">Повторное письмо уходит тем, кому первая рассылка прошла успешно (данные берутся из истории отправки).</div>
+    <div class="hint">Повторное письмо уходит тем, кому первая рассылка прошла успешно (данные берутся из истории отправки).
+      Кому уже досылали — отмечается в истории, поэтому повторный клик не отправит письмо второй раз.</div>
     <div class="bar"><i id="progBar"></i></div>
     <div id="jobStatus" class="msg"></div>
     <div class="log" id="log"></div>
@@ -824,9 +962,14 @@ async function loadConfig(){
   $('letter').value = c.letter || ''; $('followup').value = c.followup || '';
   $('signature').value = c.signature || '';
   setPhotoPill(c.has_photo, c.photo_name);
+  setAttachPill(c.has_attachment, c.attachment_name);
   $('contactsPill').textContent = c.contacts_count ? (c.contacts_count + ' контактов') : 'не загружено';
   $('workdir').textContent = 'Данные и история хранятся в папке: ' + c.workdir;
-  if (c.sent_count) setMsg($('jobStatus'), 'В истории отправки: ' + c.sent_count + ' получателей (доступно «дослать»).', true);
+  if (c.sent_count){
+    let s = 'В истории отправки: ' + c.sent_count + ' получателей (доступно «дослать»).';
+    if (c.followed_count) s += ' Из них повторное письмо уже получили: ' + c.followed_count + '.';
+    setMsg($('jobStatus'), s, true);
+  }
 }
 
 $('btnConnect').onclick = async () => {
@@ -879,6 +1022,24 @@ $('btnDeletePhoto').onclick = async () => {
   setPhotoPill(false, ''); setMsg($('sigMsg'), 'Фото убрано.', true);
 };
 
+function setAttachPill(has, name){
+  $('attachPill').textContent = has ? ('PDF: ' + (name || 'прикреплён')) : 'PDF не прикреплён';
+}
+
+$('btnUploadAttach').onclick = async () => {
+  const f = $('attachfile').files[0];
+  if (!f){ setMsg($('attachMsg'), 'Выберите файл PDF.', false); return; }
+  const fd = new FormData(); fd.append('file', f);
+  const r = await api('/api/upload_attachment', {method:'POST', body: fd});
+  if (!r.ok){ setMsg($('attachMsg'), 'Ошибка: ' + r.error, false); return; }
+  setAttachPill(true, r.name); setMsg($('attachMsg'), 'PDF прикреплён к повторному письму.', true);
+};
+
+$('btnDeleteAttach').onclick = async () => {
+  await postJSON('/api/delete_attachment', {});
+  setAttachPill(false, ''); setMsg($('attachMsg'), 'PDF убран.', true);
+};
+
 async function preview(which){
   const template = which === 'followup' ? $('followup').value : $('letter').value;
   const r = await postJSON('/api/preview', {template, which, signature: $('signature').value, count: 1});
@@ -924,11 +1085,16 @@ $('btnSend').onclick = async () => {
 };
 
 $('btnFollow').onclick = async () => {
-  if (!confirm('Дослать повторное письмо в ту же ветку (тем, кому уже отправляли)?')) return;
+  const skipDone = $('skipdone').checked;
+  const warn = skipDone
+    ? 'Дослать повторное письмо в ту же ветку? Тем, кому уже досылали, письмо повторно НЕ уйдёт.'
+    : 'ВНИМАНИЕ: галочка защиты снята — повторное письмо уйдёт ВСЕМ, включая тех, кому уже досылали. Продолжить?';
+  if (!confirm(warn)) return;
   await postJSON('/api/save_settings', collectConn());
   await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/followup', {
-    template: $('followup').value, delay: +$('delay').value, limit: +$('limit').value, only: '',
+    template: $('followup').value, delay: +$('delay').value, limit: +$('limit').value,
+    only: '', skip_done: skipDone,
   });
   if (!r.ok){ setMsg($('jobStatus'), 'Ошибка: ' + r.error, false); return; }
   setButtons(true); $('log').textContent=''; startPolling();

@@ -216,6 +216,11 @@ class SentRecord:
     internet_message_id: str = ""        # для In-Reply-To/References
     conversation_id: str = ""            # для группировки разговора
     sent_at: str = ""
+    # Повторное письмо (followup). Заполняется после успешной досылки, чтобы
+    # случайно не отправить второе письмо одному адресату несколько раз.
+    followup_status: str = ""            # "" (не досылали) | sent | failed
+    followup_message_id: str = ""        # msg-id повторного письма (для 3-го касания)
+    followup_at: str = ""
 
     def context_contact(self) -> Contact:
         return Contact(name=self.name, company=self.company,
@@ -286,46 +291,56 @@ class ExchangeClient:
             )
 
     def send_new(self, to_email: str, subject: str, body: str,
-                 html_body: str = "", inline_image=None) -> tuple[str, str]:
+                 html_body: str = "", inline_image=None,
+                 attachments=None) -> tuple[str, str]:
         """Отправляет новое письмо и сохраняет копию в «Отправленные».
 
         Если задан html_body — письмо уходит как HTML (нужно для подписи с фото).
         inline_image — кортеж (имя_файла, байты, content_id) для встроенной картинки.
+        attachments — список (имя_файла, байты) для обычных вложений (например, PDF).
         Возвращает (internet_message_id, conversation_id) для будущих ответов."""
-        msg = self._build_message(subject, body, html_body, [to_email], inline_image)
+        msg = self._build_message(subject, body, html_body, [to_email],
+                                  inline_image, attachments)
         msg.send_and_save()
         return self._read_thread_ids(msg, subject, to_email)
 
     def send_followup(self, to_email: str, subject: str, body: str,
                       in_reply_to: str, html_body: str = "",
-                      inline_image=None) -> tuple[str, str]:
+                      inline_image=None, attachments=None) -> tuple[str, str]:
         """Отправляет повторное письмо в ту же ветку.
 
         Связка ветки достигается двумя способами одновременно:
           1) одинаковая тема разговора (Outlook группирует по теме);
           2) заголовки In-Reply-To / References на исходное письмо (RFC-стандарт).
+
+        Заголовки треда поддерживаются не всеми версиями exchangelib. Поэтому
+        и СБОРКА письма с этими заголовками, и его отправка выполняются под
+        общим try: если что-то пошло не так (старая версия библиотеки, сервер
+        отклонил заголовки) — пересобираем письмо без них и всё равно отправляем.
+        Без этого у части коллег повторное письмо «совсем не отправлялось».
         """
         reply_subject = subject if subject.lower().startswith("re:") else f"RE: {subject}"
-
         headers = {"in_reply_to": in_reply_to, "references": in_reply_to} if in_reply_to else {}
-        msg = self._build_message(reply_subject, body, html_body, [to_email],
-                                  inline_image, **headers)
+
         try:
+            msg = self._build_message(reply_subject, body, html_body, [to_email],
+                                      inline_image, attachments, **headers)
             msg.send_and_save()
         except Exception:
-            # Если сервер не принял заголовки треда — повторяем без них,
-            # тред всё равно сложится по одинаковой теме разговора.
-            if in_reply_to:
-                msg = self._build_message(reply_subject, body, html_body,
-                                          [to_email], inline_image)
-                msg.send_and_save()
-            else:
-                raise
+            if not headers:
+                raise  # заголовков и не было — проблема в чём-то ещё, пробрасываем
+            # Пересобираем без заголовков треда — письмо всё равно уйдёт, а ветка
+            # сложится по одинаковой теме разговора.
+            msg = self._build_message(reply_subject, body, html_body, [to_email],
+                                      inline_image, attachments)
+            msg.send_and_save()
         return self._read_thread_ids(msg, reply_subject, to_email)
 
     def _build_message(self, subject: str, body: str, html_body: str,
-                       recipients: list[str], inline_image=None, **headers):
-        """Собирает Message: HTML или обычный текст, при наличии — с inline-картинкой."""
+                       recipients: list[str], inline_image=None,
+                       attachments=None, **headers):
+        """Собирает Message: HTML или обычный текст, при наличии — с inline-картинкой
+        и обычными вложениями (attachments: список кортежей (имя_файла, байты))."""
         from exchangelib import Message, Mailbox, HTMLBody, FileAttachment
 
         msg = Message(
@@ -339,6 +354,9 @@ class ExchangeClient:
             name, content, cid = inline_image
             msg.attach(FileAttachment(name=name, content=content,
                                       is_inline=True, content_id=cid))
+        for att in (attachments or []):
+            name, content = att
+            msg.attach(FileAttachment(name=name, content=content))
         return msg
 
     @staticmethod
@@ -470,11 +488,32 @@ def cmd_followup(args) -> None:
         wanted = {e.strip().lower() for e in args.only.split(",") if e.strip()}
         targets = [r for r in targets if r.email.lower() in wanted]
 
+    # Защита от повторной досылки: по умолчанию пропускаем тех, кому повторное
+    # письмо уже уходило (см. поле followup_status в sent_state.json). Это и есть
+    # «глобальная» защита — она живёт в файле состояния, а не только в рамках
+    # текущего запуска. Снять можно флагом --resend.
+    if not args.resend:
+        before = len(targets)
+        targets = [r for r in targets if r.followup_status != "sent"]
+        skipped = before - len(targets)
+        if skipped:
+            print(f"Пропущено уже досланных (повторное письмо им уже уходило): {skipped}")
+
     if not targets:
-        raise MailerError("Нет подходящих адресатов для повторного письма.")
+        raise MailerError("Нет подходящих адресатов для повторного письма "
+                          "(возможно, всем уже дослали; для принудительной "
+                          "повторной отправки используйте --resend).")
 
     if args.limit:
         targets = targets[: args.limit]
+
+    # Опциональное вложение (например, презентация в PDF).
+    attachments = None
+    if args.attach:
+        att_path = Path(args.attach)
+        if not att_path.exists():
+            raise MailerError(f"Не найден файл вложения: {att_path}")
+        attachments = [(att_path.name, att_path.read_bytes())]
 
     print(f"Повторных писем к отправке: {len(targets)}. "
           f"{'РЕЖИМ ПРОВЕРКИ (--dry-run).' if args.dry_run else ''}\n")
@@ -491,7 +530,8 @@ def cmd_followup(args) -> None:
 
         if args.dry_run:
             subj = r.subject if r.subject.lower().startswith("re:") else f"RE: {r.subject}"
-            print(f"{prefix}  ТЕМА: {subj}  (в ветку msg-id={r.internet_message_id or '—'})")
+            att_note = f"  +вложение: {attachments[0][0]}" if attachments else ""
+            print(f"{prefix}  ТЕМА: {subj}  (в ветку msg-id={r.internet_message_id or '—'}){att_note}")
             print("  --- тело письма ---")
             for line in body.splitlines():
                 print(f"  | {line}")
@@ -500,10 +540,17 @@ def cmd_followup(args) -> None:
 
         try:
             new_id, conv_id = client.send_followup(
-                r.email, r.subject, body, in_reply_to=r.internet_message_id
+                r.email, r.subject, body, in_reply_to=r.internet_message_id,
+                attachments=attachments,
             )
             sent += 1
             print(f"{prefix}  ✓ дослано в ту же ветку")
+            # Отмечаем в основном состоянии, что повторное письмо ушло — чтобы
+            # при следующем запуске не выслать его повторно.
+            r.followup_status = "sent"
+            r.followup_message_id = new_id
+            r.followup_at = _now_iso()
+            save_state(state_path, records)
             if followup_path is not None:
                 upsert_state(followup_records, SentRecord(
                     email=r.email, name=r.name, company=r.company,
@@ -564,6 +611,10 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("followup", parents=[common], help="Повторное письмо в ту же ветку")
     f.add_argument("--only", default="",
                    help="Слать только указанным адресам (через запятую)")
+    f.add_argument("--attach", default="",
+                   help="Путь к файлу-вложению (например, презентация в PDF)")
+    f.add_argument("--resend", action="store_true",
+                   help="Отправить повторно даже тем, кому повторное письмо уже уходило")
     f.add_argument("--followup-state", default="",
                    help="Опционально: сохранить msg-id повторных писем в отдельный JSON "
                         "(чтобы потом досылать третье письмо в ту же ветку)")
