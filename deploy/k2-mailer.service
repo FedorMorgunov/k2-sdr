@@ -1,0 +1,54 @@
+# systemd-юнит для запуска K2 Mailer в серверном режиме на Ubuntu.
+#
+# Установка:
+#   sudo cp deploy/k2-mailer.service /etc/systemd/system/k2-mailer.service
+#   sudo nano /etc/systemd/system/k2-mailer.service   # поправьте пути, EWS, секрет
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now k2-mailer
+#   sudo systemctl status k2-mailer
+#
+# Логи приложения: journalctl -u k2-mailer -f  (а также ~k2mailer/K2-Mailer/app.log)
+
+[Unit]
+Description=K2 Mailer (рассылка из OWA, веб-интерфейс)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Отдельный непривилегированный пользователь (создайте: sudo useradd -r -m -s /usr/sbin/nologin k2mailer)
+User=k2mailer
+Group=k2mailer
+
+# Каталог с кодом (куда склонирован репозиторий)
+WorkingDirectory=/opt/k2-sdr
+
+# --- Обязательные переменные окружения ---
+Environment=K2_MAILER_SERVER=1
+# Слушаем только localhost — наружу пускаем через nginx (TLS). Если nginx не
+# используете, поставьте 0.0.0.0 и закройте порт файрволом до внутренней сети.
+Environment=K2_MAILER_HOST=127.0.0.1
+Environment=K2_MAILER_PORT=8765
+# ПОСТОЯННЫЙ секрет подписи cookie (иначе при перезапуске все входы слетают).
+# Сгенерируйте: python3 -c "import secrets; print(secrets.token_hex(32))"
+Environment=K2_MAILER_SECRET=ЗАМЕНИТЕ_НА_СЛУЧАЙНУЮ_СТРОКУ
+# Папка с данными пользователей (создаётся автоматически)
+Environment=K2_MAILER_HOME=/var/lib/k2-mailer
+
+# --- Значения подключения к Exchange по умолчанию (чтобы сотрудники вводили только email+пароль) ---
+Environment=K2_EWS_URL=https://mail.k2.cloud/EWS/Exchange.asmx
+Environment=K2_AUTH_TYPE=NTLM
+Environment=K2_VERIFY_SSL=true
+
+# Запуск через venv проекта
+ExecStart=/opt/k2-sdr/.venv/bin/python /opt/k2-sdr/web_app.py
+Restart=on-failure
+RestartSec=5
+
+# Немного защиты
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/k2-mailer
+
+[Install]
+WantedBy=multi-user.target

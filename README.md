@@ -148,6 +148,124 @@ chmod +x build_mac.sh
 
 ---
 
+## Хостинг на сервере (K2 Cloud, Ubuntu) — на несколько сотрудников
+
+Вместо раздачи `.app` можно поднять приложение на одной Linux-машине, и сотрудники
+будут заходить **по сети в браузере**. Каждый работает под **своим** почтовым
+ящиком и паролем; данные пользователей изолированы.
+
+**Как устроен многопользовательский режим**
+
+- «Вход» = подключение к Exchange под логином/паролем сотрудника. Пароль живёт
+  **только в оперативной памяти сервера**, привязан к сессии (cookie) и нигде не
+  записывается на диск. Неактивные сессии выкидываются из памяти через
+  `K2_MAILER_SESSION_TTL` (по умолчанию 12 ч).
+- Настройки, шаблоны, подпись и история отправки каждого лежат в отдельной папке
+  `K2_MAILER_HOME/users/<email>` — пользователи друг друга не видят.
+- Сервер не выключается сам (в отличие от локального `.app`) и обслуживается
+  production-сервером `waitress`.
+
+> ⚠️ Поднимайте только **во внутренней сети** и **по HTTPS** (через nginx ниже) —
+> пароли ходят по сети. Наружу в интернет не выставляйте.
+
+### Шаг 1. Подготовить машину
+
+```bash
+sudo apt update && sudo apt install -y python3-venv python3-pip git nginx
+sudo useradd -r -m -s /usr/sbin/nologin k2mailer        # отдельный пользователь
+sudo mkdir -p /opt/k2-sdr /var/lib/k2-mailer
+sudo chown -R k2mailer:k2mailer /var/lib/k2-mailer
+```
+
+### Шаг 2. Выложить код и зависимости
+
+```bash
+sudo git clone <URL-репозитория> /opt/k2-sdr           # или скопируйте файлы
+cd /opt/k2-sdr
+sudo python3 -m venv .venv
+sudo .venv/bin/pip install -r requirements.txt          # включает waitress
+sudo chown -R k2mailer:k2mailer /opt/k2-sdr
+```
+
+### Шаг 3. Настроить и запустить службу (systemd)
+
+```bash
+sudo cp deploy/k2-mailer.service /etc/systemd/system/k2-mailer.service
+sudo nano /etc/systemd/system/k2-mailer.service
+```
+
+В файле обязательно поправьте:
+
+- `K2_MAILER_SECRET` — постоянная случайная строка (иначе при перезапуске все входы
+  слетят). Сгенерировать: `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+- `K2_EWS_URL` — адрес EWS вашего Exchange (например
+  `https://mail.k2.cloud/EWS/Exchange.asmx`). Тогда сотрудники вводят только email
+  и пароль.
+- При необходимости — `K2_AUTH_TYPE` (`NTLM`/`basic`) и `K2_VERIFY_SSL`.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now k2-mailer
+sudo systemctl status k2-mailer          # должно быть active (running)
+journalctl -u k2-mailer -f               # логи
+```
+
+Служба слушает `127.0.0.1:8765` (наружу её откроет nginx).
+
+### Шаг 4. HTTPS-прокси (nginx)
+
+```bash
+sudo cp deploy/nginx-k2-mailer.conf /etc/nginx/sites-available/k2-mailer
+sudo nano /etc/nginx/sites-available/k2-mailer   # server_name + пути к сертификату
+sudo ln -s /etc/nginx/sites-available/k2-mailer /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Положите корпоративный TLS-сертификат в указанные в конфиге пути (или используйте
+`certbot`, если во внутреннем контуре доступен ACME).
+
+### Шаг 5. Проверить
+
+Откройте `https://<имя-сервера>/` в браузере → введите рабочую почту и пароль →
+загрузите Excel → шаблоны → отправка. Каждый сотрудник логинится под собой.
+
+### Обязательные условия и частые проблемы
+
+- **Сеть до Exchange.** С этой VM должен быть доступен ваш почтовый сервер
+  (`telnet mail.k2.cloud 443` / `curl -I https://mail.k2.cloud/EWS/Exchange.asmx`).
+  Если EWS из облачного сегмента не виден — нужен маршрут/доступ от сетевиков, без
+  этого вход работать не будет.
+- **MFA.** Если на ящиках включена многофакторная аутентификация для EWS, обычного
+  пароля может быть недостаточно — потребуется app-password или исключение для EWS.
+- **Память/секрет.** Перезапуск службы сбрасывает активные входы (пароли в памяти) —
+  это нормально, сотрудники просто войдут снова.
+
+### Запуск в Docker (альтернатива systemd)
+
+```dockerfile
+# Dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENV K2_MAILER_SERVER=1 K2_MAILER_HOST=0.0.0.0 K2_MAILER_PORT=8765 \
+    K2_MAILER_HOME=/data
+VOLUME /data
+EXPOSE 8765
+CMD ["python", "web_app.py"]
+```
+
+```bash
+docker build -t k2-mailer .
+docker run -d --name k2-mailer -p 8765:8765 \
+  -e K2_MAILER_SECRET="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
+  -e K2_EWS_URL="https://mail.k2.cloud/EWS/Exchange.asmx" \
+  -v k2mailer-data:/data k2-mailer
+```
+
+HTTPS так же ставится отдельным nginx/прокси перед контейнером.
+
 ---
 
 ## Что умеет

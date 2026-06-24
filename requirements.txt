@@ -1,3 +1,4 @@
 exchangelib>=5.0,<6.0
 openpyxl>=3.0
 flask>=3.0
+waitress>=3.0

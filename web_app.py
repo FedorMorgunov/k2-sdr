@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""Локальный веб-интерфейс для рассылки писем из OWA (Exchange/EWS).
+"""Веб-интерфейс для рассылки писем из OWA (Exchange/EWS).
 
-Запускает маленький сервер на 127.0.0.1 и открывает страницу в браузере.
-Работает одинаково на macOS и Windows. Вся логика отправки переиспользуется
-из mailer.py.
+Два режима работы одним кодом:
 
-Запуск из исходников:
-    pip install -r requirements.txt
-    python web_app.py
+  * Локально (двойной клик по .app/.exe) — открывает страницу в браузере,
+    сам выключается при закрытии окна. Удобно одному сотруднику на своей машине.
 
-Сборка в приложение (.app для macOS) — см. build_mac.sh и README.
+  * Сервер (хостинг, напр. на VM в K2 Cloud) — несколько сотрудников заходят по
+    сети, КАЖДЫЙ под своим почтовым ящиком и паролем. Включается переменной
+    окружения K2_MAILER_SERVER=1. В этом режиме сервер не выключается сам и
+    слушает все интерфейсы (за обратным прокси/файрволом).
 
-Особенности:
-  * Пароль хранится только в оперативной памяти процесса, никуда не пишется.
-  * Настройки подключения (без пароля) и шаблоны сохраняются в папке
-    ~/K2-Mailer, туда же кладётся состояние рассылки (sent_state.json),
-    чтобы можно было дослать письма в ту же ветку даже после перезапуска.
+Безопасность многопользовательского режима:
+  * «Вход» = подключение к Exchange по логину/паролю сотрудника. Пароль живёт
+    ТОЛЬКО в оперативной памяти сервера, привязан к сессии (cookie) и нигде не
+    записывается на диск.
+  * Данные каждого пользователя (настройки, шаблоны, подпись, история отправки)
+    лежат в отдельной папке ~/K2-Mailer/users/<email> — пользователи друг друга
+    не видят.
+  * Запускать только во внутренней сети и по HTTPS (см. README, раздел про
+    хостинг) — пароли ходят по сети.
 """
 
 from __future__ import annotations
 
 import html as htmllib
+import json
 import logging
 import os
+import re as _re
+import secrets
 import socket
 import subprocess
 import sys
@@ -31,9 +38,10 @@ import time
 import urllib.request
 import webbrowser
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort, session
 
 import mailer
 from mailer import (
@@ -50,12 +58,34 @@ from mailer import (
 )
 
 APP_NAME = "K2 Mailer"
-HOST = "127.0.0.1"
+
+# --------------------------------------------------------------------------- #
+# Режим и сетевые настройки (управляются переменными окружения)
+# --------------------------------------------------------------------------- #
+def _envbool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+SERVER_MODE = _envbool("K2_MAILER_SERVER", False)
+# В серверном режиме по умолчанию слушаем все интерфейсы (за прокси/файрволом),
+# локально — только loopback.
+HOST = os.environ.get("K2_MAILER_HOST") or ("0.0.0.0" if SERVER_MODE else "127.0.0.1")
 PORT = int(os.environ.get("K2_MAILER_PORT", "8765"))
 
-# Шаблоны-«открывашки». Могут содержать HTML-разметку (жирный/курсив/подчёркивание,
-# абзацы) — она сохраняется в письме. Переменные {имя}/{компания} подставляются как
-# обычно. Если в шаблоне нет HTML-тегов, текст уходит как обычный (с переносами строк).
+# Серверные значения подключения по умолчанию (Exchange у всех обычно один и тот
+# же) — чтобы сотрудники вводили только email и пароль. Можно переопределить в форме.
+ENV_EWS_URL = os.environ.get("K2_EWS_URL", "").strip()
+ENV_AUTH_TYPE = os.environ.get("K2_AUTH_TYPE", "NTLM").strip() or "NTLM"
+ENV_VERIFY_SSL = _envbool("K2_VERIFY_SSL", True)
+
+HEARTBEAT_TIMEOUT = float(os.environ.get("K2_MAILER_IDLE_TIMEOUT", "15"))
+# Сколько держать неактивную сессию в памяти, прежде чем выкинуть пароль (сек).
+SESSION_TTL = float(os.environ.get("K2_MAILER_SESSION_TTL", str(12 * 3600)))
+
+
 DEFAULT_LETTER = (
     "<p>{имя}, добрый день!</p>\n"
     "<p>В последние 5 лет мы помогаем многим фармкомпаниям создать и разместить "
@@ -86,65 +116,119 @@ DEFAULT_FOLLOWUP = (
     "<p>Подскажите, актуальна ли задача по локализации вашего сайта?</p>\n"
 )
 
+PHOTO_CID = "sigphoto"
+PHOTO_STEM = "signature_photo"
+ATTACH_STEM = "followup_attachment"
+ALLOWED_PHOTO_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+ALLOWED_ATTACH_EXT = {".pdf"}
+
 
 # --------------------------------------------------------------------------- #
-# Рабочая папка и файлы
+# Папки данных: общая база + отдельная папка на каждого пользователя
 # --------------------------------------------------------------------------- #
-def workdir() -> Path:
+def base_dir() -> Path:
     base = Path(os.environ.get("K2_MAILER_HOME") or (Path.home() / "K2-Mailer"))
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
-def state_file() -> Path:
-    return workdir() / "sent_state.json"
+def _safe_email(email: str) -> str:
+    s = _re.sub(r"[^a-z0-9._@+-]+", "_", (email or "").strip().lower())
+    return s or "default"
 
 
-def excel_file() -> Path:
-    return workdir() / "contacts.xlsx"
+def udir(email: str) -> Path:
+    d = base_dir() / "users" / _safe_email(email)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def conn_file() -> Path:
-    return workdir() / "connection.json"
+def state_file(email: str) -> Path:
+    return udir(email) / "sent_state.json"
 
 
-def template_file(kind: str) -> Path:
-    return workdir() / (f"{kind}.txt")
+def excel_file(email: str) -> Path:
+    return udir(email) / "contacts.xlsx"
 
 
-def default_template(kind: str) -> str:
-    saved = template_file(kind)
+def conn_file(email: str) -> Path:
+    return udir(email) / "connection.json"
+
+
+def template_file(email: str, kind: str) -> Path:
+    return udir(email) / f"{kind}.txt"
+
+
+def signature_file(email: str) -> Path:
+    return udir(email) / "signature.html"
+
+
+def photo_path(email: str) -> Path | None:
+    for p in udir(email).glob(PHOTO_STEM + ".*"):
+        return p
+    return None
+
+
+def attachment_path(email: str) -> Path | None:
+    for p in udir(email).glob(ATTACH_STEM + ".*"):
+        return p
+    return None
+
+
+def read_conn(email: str) -> dict:
+    f = conn_file(email)
+    if f.exists():
+        return json.loads(f.read_text(encoding="utf-8"))
+    return {}
+
+
+def write_conn(email: str, data: dict) -> None:
+    conn_file(email).write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+
+
+def default_template(email: str, kind: str) -> str:
+    saved = template_file(email, kind)
     if saved.exists():
         return saved.read_text(encoding="utf-8")
     return DEFAULT_LETTER if kind == "letter" else DEFAULT_FOLLOWUP
 
 
-# --------------------------------------------------------------------------- #
-# Подпись (HTML) и фото для неё. Хранятся локально => у каждого сотрудника своя.
-# --------------------------------------------------------------------------- #
-PHOTO_CID = "sigphoto"
-PHOTO_STEM = "signature_photo"
-
-
-def signature_file() -> Path:
-    return workdir() / "signature.html"
-
-
-def read_signature() -> str:
-    f = signature_file()
+def read_signature(email: str) -> str:
+    f = signature_file(email)
     return f.read_text(encoding="utf-8") if f.exists() else ""
 
 
-def photo_path() -> Path | None:
-    for p in workdir().glob(PHOTO_STEM + ".*"):
-        return p
+def signature_active(email: str) -> bool:
+    return bool(read_signature(email).strip())
+
+
+def attachment_display_name(email: str) -> str:
+    p = attachment_path(email)
+    if not p:
+        return ""
+    return read_conn(email).get("attachment_name") or p.name
+
+
+def inline_photo_for_send(email: str):
+    sig = read_signature(email)
+    p = photo_path(email)
+    if p and "{photo}" in sig:
+        return (p.name, p.read_bytes(), PHOTO_CID)
     return None
 
 
-import re as _re
+def attachment_for_send(email: str):
+    p = attachment_path(email)
+    if not p:
+        return None
+    return [(attachment_display_name(email), p.read_bytes())]
 
-# Признак того, что шаблон уже содержит HTML-разметку (тогда не экранируем).
-# Тег должен идти сразу после "<" или "</" и завершаться пробелом, "/" или ">",
+
+# --------------------------------------------------------------------------- #
+# HTML тела письма
+# --------------------------------------------------------------------------- #
+# Тег должен идти сразу после "<"/"</" и завершаться пробелом, "/" или ">",
 # чтобы обычный текст вроде "a < b" не принимался за HTML.
 _HTML_TAG_RE = _re.compile(
     r"</?(?:p|br|b|i|u|em|strong|div|span|ul|ol|li|a|table|tr|td|h[1-6]|blockquote)(?:\s|/|>)",
@@ -157,107 +241,33 @@ def looks_like_html(text: str) -> bool:
 
 
 def text_to_html(text: str) -> str:
-    """Готовит тело письма в HTML.
-
-    Если в шаблоне есть HTML-разметку (абзацы, <b>/<i>/<u> и т.п.) — используем
-    как есть, чтобы сохранить форматирование «открывашек». Если это обычный
-    текст — экранируем и переносы строк превращаем в <br>.
-    """
     inner = text if looks_like_html(text) else htmllib.escape(text).replace("\n", "<br>")
     return ('<div style="font-family:Calibri,Arial,sans-serif;font-size:14px;'
             'color:#222;line-height:1.5;">' + inner + "</div>")
 
 
-def build_email_html(rendered_body: str, photo_ref: str, signature=None) -> str:
-    """Собирает HTML письма: текст письма + HTML-подпись.
-
-    signature — текст подписи; если None, берётся сохранённая (для предпросмотра
-    передаём текущее содержимое поля, чтобы видеть несохранённые правки).
-    photo_ref подставляется вместо токена {photo} в подписи:
-      * при отправке  — 'cid:sigphoto' (картинка вложена в письмо);
-      * в предпросмотре — URL '/api/sigphoto' (видно в браузере).
-    """
+def build_email_html(email: str, rendered_body: str, photo_ref: str, signature=None) -> str:
     parts = [text_to_html(rendered_body)]
-    sig = (read_signature() if signature is None else signature).strip()
+    sig = (read_signature(email) if signature is None else signature).strip()
     if sig:
         parts.append("<br>" + sig.replace("{photo}", photo_ref or ""))
     return ("<html><body style=\"margin:0;padding:0;\">"
             + "".join(parts) + "</body></html>")
 
 
-def signature_active() -> bool:
-    return bool(read_signature().strip())
-
-
-def inline_photo_for_send():
-    """Возвращает (имя, байты, cid) если подпись использует {photo} и фото есть."""
-    sig = read_signature()
-    p = photo_path()
-    if p and "{photo}" in sig:
-        return (p.name, p.read_bytes(), PHOTO_CID)
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# Вложение для повторного письма (например, презентация в PDF).
-# Хранится локально; оригинальное имя файла — в connection.json.
-# --------------------------------------------------------------------------- #
-ATTACH_STEM = "followup_attachment"
-
-
-def attachment_path() -> Path | None:
-    for p in workdir().glob(ATTACH_STEM + ".*"):
-        return p
-    return None
-
-
-def attachment_display_name() -> str:
-    p = attachment_path()
-    if not p:
-        return ""
-    return read_conn().get("attachment_name") or p.name
-
-
-def attachment_for_send():
-    """Возвращает [(имя, байты)] для отправки или None, если вложения нет."""
-    p = attachment_path()
-    if not p:
-        return None
-    return [(attachment_display_name(), p.read_bytes())]
-
-
-# --------------------------------------------------------------------------- #
-# Хранилище настроек подключения (без пароля)
-# --------------------------------------------------------------------------- #
-import json
-
-
-def read_conn() -> dict:
-    if conn_file().exists():
-        return json.loads(conn_file().read_text(encoding="utf-8"))
-    return {}
-
-
-def write_conn(data: dict) -> None:
-    conn_file().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def current_config() -> ExchangeConfig:
-    d = read_conn()
-    email = (d.get("email") or "").strip()
-    if not email:
-        raise MailerError("Не заполнен адрес почты в разделе «Подключение».")
+def current_config(st: "UserState") -> ExchangeConfig:
+    d = read_conn(st.email)
     return ExchangeConfig(
-        email=email,
-        username=(d.get("username") or "").strip() or email,
+        email=st.email,
+        username=(d.get("username") or "").strip() or st.email,
         ews_url=(d.get("ews_url") or "").strip(),
-        auth_type=(d.get("auth_type") or "auto").strip() or "auto",
+        auth_type=(d.get("auth_type") or ENV_AUTH_TYPE).strip() or "NTLM",
         verify_ssl=bool(d.get("verify_ssl", True)),
     )
 
 
-def current_cols() -> ColumnMap:
-    c = (read_conn().get("columns") or {})
+def current_cols(email: str) -> ColumnMap:
+    c = (read_conn(email).get("columns") or {})
     base = ColumnMap()
     return ColumnMap(
         name=(c.get("name") or base.name),
@@ -268,27 +278,55 @@ def current_cols() -> ColumnMap:
 
 
 # --------------------------------------------------------------------------- #
-# Состояние в памяти: пароль, загруженные контакты, текущая задача
+# Сессии пользователей (в памяти). Пароль НЕ пишется на диск.
 # --------------------------------------------------------------------------- #
-SESSION = {"password": "", "contacts": []}  # contacts: list[mailer.Contact]
-
-JOB_LOCK = threading.Lock()
-JOB = {
-    "running": False, "kind": "", "total": 0, "done": 0,
-    "sent": 0, "failed": 0, "log": [], "error": "", "finished": False,
-}
+def _empty_job() -> dict:
+    return {"running": False, "kind": "", "total": 0, "done": 0,
+            "sent": 0, "failed": 0, "log": [], "error": "", "finished": False}
 
 
-def job_reset(kind: str) -> None:
-    with JOB_LOCK:
-        JOB.update(running=True, kind=kind, total=0, done=0,
-                   sent=0, failed=0, log=[], error="", finished=False)
+class UserState:
+    def __init__(self, email: str):
+        self.email = email
+        self.password = ""
+        self.contacts: list = []
+        self.job = _empty_job()
+        self.job_lock = threading.Lock()
+        self.last_beat = time.time()
 
 
-def job_log(line: str) -> None:
+USERS: dict[str, UserState] = {}
+USERS_LOCK = threading.Lock()
+
+
+def current_state() -> UserState | None:
+    uid = session.get("uid")
+    if not uid:
+        return None
+    with USERS_LOCK:
+        return USERS.get(uid)
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if current_state() is None:
+            return jsonify({"ok": False, "authed": False,
+                            "error": "Сессия не найдена — войдите заново."}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def job_reset(st: UserState, kind: str) -> None:
+    with st.job_lock:
+        st.job.update(running=True, kind=kind, total=0, done=0,
+                      sent=0, failed=0, log=[], error="", finished=False)
+
+
+def job_log(st: UserState, line: str) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
-    with JOB_LOCK:
-        JOB["log"].append(f"[{stamp}] {line}")
+    with st.job_lock:
+        st.job["log"].append(f"[{stamp}] {line}")
 
 
 def _now_iso() -> str:
@@ -296,18 +334,19 @@ def _now_iso() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Фоновые задачи: рассылка и повторная отправка
+# Фоновые задачи (работают в контексте конкретного пользователя)
 # --------------------------------------------------------------------------- #
-def worker_send(template: str, delay: float, limit: int, resume: bool) -> None:
+def worker_send(st: UserState, template: str, delay: float, limit: int, resume: bool) -> None:
+    email = st.email
     try:
-        cfg = current_config()
-        contacts = list(SESSION["contacts"])
+        cfg = current_config(st)
+        contacts = list(st.contacts)
         if not contacts:
             raise MailerError("Сначала загрузите Excel со списком контактов.")
-        if not SESSION["password"]:
-            raise MailerError("Сначала укажите пароль и нажмите «Проверить подключение».")
+        if not st.password:
+            raise MailerError("Сначала войдите (укажите пароль).")
 
-        records = load_state(state_file())
+        records = load_state(state_file(email))
         already = {r.email.lower() for r in records if r.status == "sent"}
         todo = [c for c in contacts if not (resume and c.email.lower() in already)]
         if limit > 0:
@@ -315,65 +354,67 @@ def worker_send(template: str, delay: float, limit: int, resume: bool) -> None:
         if not todo:
             raise MailerError("Нет писем к отправке (возможно, все уже отправлены).")
 
-        with JOB_LOCK:
-            JOB["total"] = len(todo)
-        job_log(f"Подключение к Exchange как {cfg.email} …")
-        client = ExchangeClient(cfg, SESSION["password"])
-        job_log("Подключение установлено. Начинаю рассылку.")
+        with st.job_lock:
+            st.job["total"] = len(todo)
+        job_log(st, f"Подключение к Exchange как {cfg.email} …")
+        client = ExchangeClient(cfg, st.password)
+        job_log(st, "Подключение установлено. Начинаю рассылку.")
 
         for i, c in enumerate(todo, start=1):
             body = render_template(template, c)
             subject = c.subject or "(без темы)"
             try:
-                html = build_email_html(body, "cid:" + PHOTO_CID)
+                html = build_email_html(email, body, "cid:" + PHOTO_CID)
                 mid, conv = client.send_new(c.email, subject, body,
-                                            html_body=html, inline_image=inline_photo_for_send())
+                                            html_body=html,
+                                            inline_image=inline_photo_for_send(email))
                 upsert_state(records, SentRecord(
                     email=c.email, name=c.name, company=c.company, subject=subject,
                     status="sent", internet_message_id=mid, conversation_id=conv,
                     sent_at=_now_iso(),
                 ))
-                with JOB_LOCK:
-                    JOB["sent"] += 1
-                job_log(f"✓ [{i}/{len(todo)}] {c.email} — отправлено")
+                with st.job_lock:
+                    st.job["sent"] += 1
+                job_log(st, f"✓ [{i}/{len(todo)}] {c.email} — отправлено")
             except Exception as exc:
                 upsert_state(records, SentRecord(
                     email=c.email, name=c.name, company=c.company, subject=subject,
                     status="failed", error=str(exc), sent_at=_now_iso(),
                 ))
-                with JOB_LOCK:
-                    JOB["failed"] += 1
-                job_log(f"✗ [{i}/{len(todo)}] {c.email} — ошибка: {exc}")
+                with st.job_lock:
+                    st.job["failed"] += 1
+                job_log(st, f"✗ [{i}/{len(todo)}] {c.email} — ошибка: {exc}")
 
-            save_state(state_file(), records)
-            with JOB_LOCK:
-                JOB["done"] = i
+            save_state(state_file(email), records)
+            with st.job_lock:
+                st.job["done"] = i
             if delay and i < len(todo):
                 time.sleep(delay)
 
-        job_log(f"Готово. Отправлено: {JOB['sent']}, ошибок: {JOB['failed']}.")
+        job_log(st, f"Готово. Отправлено: {st.job['sent']}, ошибок: {st.job['failed']}.")
     except MailerError as exc:
-        with JOB_LOCK:
-            JOB["error"] = str(exc)
-        job_log(f"Ошибка: {exc}")
-    except Exception as exc:  # неожиданное
-        with JOB_LOCK:
-            JOB["error"] = str(exc)
-        job_log(f"Непредвиденная ошибка: {exc}")
+        with st.job_lock:
+            st.job["error"] = str(exc)
+        job_log(st, f"Ошибка: {exc}")
+    except Exception as exc:
+        with st.job_lock:
+            st.job["error"] = str(exc)
+        job_log(st, f"Непредвиденная ошибка: {exc}")
     finally:
-        with JOB_LOCK:
-            JOB["running"] = False
-            JOB["finished"] = True
+        with st.job_lock:
+            st.job["running"] = False
+            st.job["finished"] = True
 
 
-def worker_followup(template: str, delay: float, limit: int, only: str,
-                    skip_done: bool = True) -> None:
+def worker_followup(st: UserState, template: str, delay: float, limit: int,
+                    only: str, skip_done: bool = True) -> None:
+    email = st.email
     try:
-        cfg = current_config()
-        if not SESSION["password"]:
-            raise MailerError("Сначала укажите пароль и нажмите «Проверить подключение».")
+        cfg = current_config(st)
+        if not st.password:
+            raise MailerError("Сначала войдите (укажите пароль).")
 
-        records = load_state(state_file())
+        records = load_state(state_file(email))
         if not records:
             raise MailerError("Нет данных о первой рассылке. Сначала выполните рассылку.")
 
@@ -381,15 +422,12 @@ def worker_followup(template: str, delay: float, limit: int, only: str,
         if only.strip():
             wanted = {e.strip().lower() for e in only.split(",") if e.strip()}
             targets = [r for r in targets if r.email.lower() in wanted]
-        # Защита от случайной повторной досылки: пропускаем тех, кому повторное
-        # письмо уже уходило (отметка хранится в sent_state.json — то есть «глобально»,
-        # а не только в рамках текущей сессии приложения).
         if skip_done:
             before = len(targets)
             targets = [r for r in targets if r.followup_status != "sent"]
             skipped = before - len(targets)
             if skipped:
-                job_log(f"Пропущено уже досланных (им повторное письмо уже уходило): {skipped}")
+                job_log(st, f"Пропущено уже досланных (им повторное письмо уже уходило): {skipped}")
         if not targets:
             raise MailerError("Нет адресатов для повторного письма: либо нет успешной "
                               "первой рассылки, либо всем уже дослали. Чтобы отправить "
@@ -397,65 +435,63 @@ def worker_followup(template: str, delay: float, limit: int, only: str,
         if limit > 0:
             targets = targets[:limit]
 
-        attachments = attachment_for_send()
+        attachments = attachment_for_send(email)
 
-        with JOB_LOCK:
-            JOB["total"] = len(targets)
-        job_log(f"Подключение к Exchange как {cfg.email} …")
-        client = ExchangeClient(cfg, SESSION["password"])
+        with st.job_lock:
+            st.job["total"] = len(targets)
+        job_log(st, f"Подключение к Exchange как {cfg.email} …")
+        client = ExchangeClient(cfg, st.password)
         if attachments:
-            job_log(f"К повторному письму прикреплено вложение: {attachments[0][0]}")
-        job_log("Подключение установлено. Досылаю письма в ту же ветку.")
+            job_log(st, f"К повторному письму прикреплено вложение: {attachments[0][0]}")
+        job_log(st, "Подключение установлено. Досылаю письма в ту же ветку.")
 
         for i, r in enumerate(targets, start=1):
             body = render_template(template, r.context_contact())
             try:
-                html = build_email_html(body, "cid:" + PHOTO_CID)
+                html = build_email_html(email, body, "cid:" + PHOTO_CID)
                 new_id, _conv = client.send_followup(
                     r.email, r.subject, body,
                     in_reply_to=r.internet_message_id,
-                    html_body=html, inline_image=inline_photo_for_send(),
+                    html_body=html, inline_image=inline_photo_for_send(email),
                     attachments=attachments,
                 )
-                # Помечаем в состоянии, что повторное письмо ушло (чтобы не выслать снова).
                 r.followup_status = "sent"
                 r.followup_message_id = new_id
                 r.followup_at = _now_iso()
-                save_state(state_file(), records)
-                with JOB_LOCK:
-                    JOB["sent"] += 1
-                job_log(f"✓ [{i}/{len(targets)}] {r.email} — дослано в ту же ветку")
+                save_state(state_file(email), records)
+                with st.job_lock:
+                    st.job["sent"] += 1
+                job_log(st, f"✓ [{i}/{len(targets)}] {r.email} — дослано в ту же ветку")
             except Exception as exc:
-                with JOB_LOCK:
-                    JOB["failed"] += 1
-                job_log(f"✗ [{i}/{len(targets)}] {r.email} — ошибка: {exc}")
-            with JOB_LOCK:
-                JOB["done"] = i
+                with st.job_lock:
+                    st.job["failed"] += 1
+                job_log(st, f"✗ [{i}/{len(targets)}] {r.email} — ошибка: {exc}")
+            with st.job_lock:
+                st.job["done"] = i
             if delay and i < len(targets):
                 time.sleep(delay)
 
-        job_log(f"Готово. Дослано: {JOB['sent']}, ошибок: {JOB['failed']}.")
+        job_log(st, f"Готово. Дослано: {st.job['sent']}, ошибок: {st.job['failed']}.")
     except MailerError as exc:
-        with JOB_LOCK:
-            JOB["error"] = str(exc)
-        job_log(f"Ошибка: {exc}")
+        with st.job_lock:
+            st.job["error"] = str(exc)
+        job_log(st, f"Ошибка: {exc}")
     except Exception as exc:
-        with JOB_LOCK:
-            JOB["error"] = str(exc)
-        job_log(f"Непредвиденная ошибка: {exc}")
+        with st.job_lock:
+            st.job["error"] = str(exc)
+        job_log(st, f"Непредвиденная ошибка: {exc}")
     finally:
-        with JOB_LOCK:
-            JOB["running"] = False
-            JOB["finished"] = True
+        with st.job_lock:
+            st.job["running"] = False
+            st.job["finished"] = True
 
 
-def start_job(target, *args) -> bool:
-    with JOB_LOCK:
-        if JOB["running"]:
+def start_job(st: UserState, target, *args) -> bool:
+    with st.job_lock:
+        if st.job["running"]:
             return False
-    kind = "followup" if target is worker_followup else "send"
-    job_reset(kind)
-    threading.Thread(target=target, args=args, daemon=True).start()
+    job_reset(st, "followup" if target is worker_followup else "send")
+    threading.Thread(target=target, args=(st, *args), daemon=True).start()
     return True
 
 
@@ -463,6 +499,15 @@ def start_job(target, *args) -> bool:
 # Flask
 # --------------------------------------------------------------------------- #
 app = Flask(__name__)
+# Ключ подписи cookie сессии. Лучше задать постоянным через K2_MAILER_SECRET,
+# иначе при перезапуске сервера все сессии (входы) сбросятся.
+app.secret_key = os.environ.get("K2_MAILER_SECRET") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Cookie помечается Secure в серверном режиме (предполагается HTTPS за прокси).
+    SESSION_COOKIE_SECURE=SERVER_MODE,
+)
 
 
 @app.get("/")
@@ -470,198 +515,248 @@ def index():
     return INDEX_HTML
 
 
-@app.get("/api/config")
-def api_get_config():
-    d = read_conn()
-    cols = current_cols()
-    records = load_state(state_file())
-    sent = sum(1 for r in records if r.status == "sent")
-    followed = sum(1 for r in records if r.status == "sent" and r.followup_status == "sent")
+@app.get("/api/me")
+def api_me():
+    st = current_state()
     return jsonify({
-        "email": d.get("email", ""),
-        "username": d.get("username", ""),
-        "ews_url": d.get("ews_url", ""),
-        "auth_type": d.get("auth_type", "NTLM"),
-        "verify_ssl": bool(d.get("verify_ssl", True)),
-        "columns": {"name": cols.name, "company": cols.company,
-                    "email": cols.email, "subject": cols.subject},
-        "letter": default_template("letter"),
-        "followup": default_template("followup"),
-        "signature": read_signature(),
-        "has_photo": photo_path() is not None,
-        "photo_name": photo_path().name if photo_path() else "",
-        "has_attachment": attachment_path() is not None,
-        "attachment_name": attachment_display_name(),
-        "has_password": bool(SESSION["password"]),
-        "contacts_count": len(SESSION["contacts"]),
-        "sent_count": sent,
-        "followed_count": followed,
-        "workdir": str(workdir()),
+        "authed": st is not None,
+        "email": st.email if st else "",
+        "server_mode": SERVER_MODE,
     })
 
 
-@app.post("/api/connect")
-def api_connect():
+@app.get("/api/defaults")
+def api_defaults():
+    """Значения для предзаполнения формы входа (без пароля)."""
+    return jsonify({
+        "ews_url": ENV_EWS_URL,
+        "auth_type": ENV_AUTH_TYPE,
+        "verify_ssl": ENV_VERIFY_SSL,
+    })
+
+
+@app.post("/api/login")
+def api_login():
     data = request.get_json(force=True)
-    conn = {
-        "email": (data.get("email") or "").strip(),
-        "username": (data.get("username") or "").strip(),
-        "ews_url": (data.get("ews_url") or "").strip(),
-        "auth_type": (data.get("auth_type") or "NTLM").strip(),
-        "verify_ssl": bool(data.get("verify_ssl", True)),
-        "columns": data.get("columns") or read_conn().get("columns") or {},
-    }
-    write_conn(conn)
+    email = (data.get("email") or "").strip()
     password = data.get("password") or ""
-    if password:
-        SESSION["password"] = password
-    if not SESSION["password"]:
+    if not email:
+        return jsonify({"ok": False, "error": "Укажите email."}), 400
+    if not password:
         return jsonify({"ok": False, "error": "Введите пароль."}), 400
+
+    # Сохраняем настройки подключения этого пользователя (без пароля).
+    conn = read_conn(email)
+    conn["email"] = email
+    conn["username"] = (data.get("username") or "").strip()
+    conn["ews_url"] = (data.get("ews_url") or ENV_EWS_URL).strip()
+    conn["auth_type"] = (data.get("auth_type") or ENV_AUTH_TYPE).strip()
+    conn["verify_ssl"] = bool(data.get("verify_ssl", ENV_VERIFY_SSL))
+    if data.get("columns"):
+        conn["columns"] = data["columns"]
+    write_conn(email, conn)
+
+    st = UserState(email)
+    st.password = password
     try:
-        cfg = current_config()
-        client = ExchangeClient(cfg, SESSION["password"])
-        # лёгкая проверка, что доступ есть
-        _ = client.account.inbox.total_count
-        return jsonify({"ok": True, "message": f"Подключено: {cfg.email}"})
+        cfg = current_config(st)
+        client = ExchangeClient(cfg, password)
+        _ = client.account.inbox.total_count  # лёгкая проверка доступа
     except MailerError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"Не удалось подключиться: {exc}"}), 400
+        return jsonify({"ok": False, "error": f"Не удалось войти: {exc}"}), 400
+
+    uid = secrets.token_hex(16)
+    with USERS_LOCK:
+        USERS[uid] = st
+    session["uid"] = uid
+    return jsonify({"ok": True, "email": email, "message": f"Вход выполнен: {email}"})
+
+
+@app.post("/api/logout")
+def api_logout():
+    uid = session.pop("uid", None)
+    if uid:
+        with USERS_LOCK:
+            USERS.pop(uid, None)  # удаляем пароль из памяти
+    return jsonify({"ok": True})
+
+
+@app.get("/api/config")
+@login_required
+def api_get_config():
+    st = current_state()
+    email = st.email
+    d = read_conn(email)
+    cols = current_cols(email)
+    records = load_state(state_file(email))
+    sent = sum(1 for r in records if r.status == "sent")
+    followed = sum(1 for r in records if r.status == "sent" and r.followup_status == "sent")
+    return jsonify({
+        "email": email,
+        "username": d.get("username", ""),
+        "ews_url": d.get("ews_url", ""),
+        "auth_type": d.get("auth_type", ENV_AUTH_TYPE),
+        "verify_ssl": bool(d.get("verify_ssl", True)),
+        "columns": {"name": cols.name, "company": cols.company,
+                    "email": cols.email, "subject": cols.subject},
+        "letter": default_template(email, "letter"),
+        "followup": default_template(email, "followup"),
+        "signature": read_signature(email),
+        "has_photo": photo_path(email) is not None,
+        "photo_name": photo_path(email).name if photo_path(email) else "",
+        "has_attachment": attachment_path(email) is not None,
+        "attachment_name": attachment_display_name(email),
+        "contacts_count": len(st.contacts),
+        "sent_count": sent,
+        "followed_count": followed,
+        "workdir": str(udir(email)),
+        "server_mode": SERVER_MODE,
+    })
 
 
 @app.post("/api/save_settings")
+@login_required
 def api_save_settings():
-    """Сохранить настройки/колонки без проверки подключения."""
+    st = current_state()
     data = request.get_json(force=True)
-    conn = read_conn()
-    for k in ("email", "username", "ews_url", "auth_type"):
+    conn = read_conn(st.email)
+    for k in ("username", "ews_url", "auth_type"):
         if k in data:
             conn[k] = (data.get(k) or "").strip()
     if "verify_ssl" in data:
         conn["verify_ssl"] = bool(data["verify_ssl"])
     if data.get("columns"):
         conn["columns"] = data["columns"]
-    write_conn(conn)
-    if data.get("password"):
-        SESSION["password"] = data["password"]
+    write_conn(st.email, conn)
     return jsonify({"ok": True})
 
 
 @app.post("/api/upload")
+@login_required
 def api_upload():
-    if "file" not in request.files:
+    st = current_state()
+    if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"ok": False, "error": "Файл не выбран."}), 400
     f = request.files["file"]
-    if not f.filename:
-        return jsonify({"ok": False, "error": "Файл не выбран."}), 400
-    path = excel_file()
+    path = excel_file(st.email)
     f.save(path)
     try:
-        contacts = read_contacts(path, current_cols())
+        contacts = read_contacts(path, current_cols(st.email))
     except MailerError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    SESSION["contacts"] = contacts
+    st.contacts = contacts
     preview = [{"name": c.name, "company": c.company, "email": c.email,
                 "subject": c.subject} for c in contacts[:5]]
     return jsonify({"ok": True, "count": len(contacts), "preview": preview})
 
 
 @app.post("/api/save_templates")
+@login_required
 def api_save_templates():
+    st = current_state()
     data = request.get_json(force=True)
     if "letter" in data:
-        template_file("letter").write_text(data["letter"], encoding="utf-8")
+        template_file(st.email, "letter").write_text(data["letter"], encoding="utf-8")
     if "followup" in data:
-        template_file("followup").write_text(data["followup"], encoding="utf-8")
+        template_file(st.email, "followup").write_text(data["followup"], encoding="utf-8")
     return jsonify({"ok": True})
 
 
 @app.post("/api/save_signature")
+@login_required
 def api_save_signature():
+    st = current_state()
     data = request.get_json(force=True)
-    signature_file().write_text(data.get("signature", ""), encoding="utf-8")
+    signature_file(st.email).write_text(data.get("signature", ""), encoding="utf-8")
     return jsonify({"ok": True})
 
 
-ALLOWED_PHOTO_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
-
-
 @app.post("/api/upload_photo")
+@login_required
 def api_upload_photo():
+    st = current_state()
     if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"ok": False, "error": "Файл не выбран."}), 400
     f = request.files["file"]
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in ALLOWED_PHOTO_EXT:
         return jsonify({"ok": False, "error": "Допустимы только изображения (png, jpg, gif, bmp)."}), 400
-    # удаляем прежнее фото (любого расширения), сохраняем новое
-    for old in workdir().glob(PHOTO_STEM + ".*"):
+    for old in udir(st.email).glob(PHOTO_STEM + ".*"):
         old.unlink()
-    f.save(workdir() / (PHOTO_STEM + ext))
+    f.save(udir(st.email) / (PHOTO_STEM + ext))
     return jsonify({"ok": True, "name": PHOTO_STEM + ext})
 
 
 @app.post("/api/delete_photo")
+@login_required
 def api_delete_photo():
-    for old in workdir().glob(PHOTO_STEM + ".*"):
+    st = current_state()
+    for old in udir(st.email).glob(PHOTO_STEM + ".*"):
         old.unlink()
     return jsonify({"ok": True})
 
 
 @app.get("/api/sigphoto")
+@login_required
 def api_sigphoto():
-    p = photo_path()
+    st = current_state()
+    p = photo_path(st.email)
     if not p:
         abort(404)
     return send_file(p)
 
 
-ALLOWED_ATTACH_EXT = {".pdf"}
-
-
 @app.post("/api/upload_attachment")
+@login_required
 def api_upload_attachment():
+    st = current_state()
     if "file" not in request.files or not request.files["file"].filename:
         return jsonify({"ok": False, "error": "Файл не выбран."}), 400
     f = request.files["file"]
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in ALLOWED_ATTACH_EXT:
         return jsonify({"ok": False, "error": "Допустим только файл PDF."}), 400
-    # удаляем прежнее вложение (любого расширения), сохраняем новое
-    for old in workdir().glob(ATTACH_STEM + ".*"):
+    for old in udir(st.email).glob(ATTACH_STEM + ".*"):
         old.unlink()
-    f.save(workdir() / (ATTACH_STEM + ext))
-    conn = read_conn()
+    f.save(udir(st.email) / (ATTACH_STEM + ext))
+    conn = read_conn(st.email)
     conn["attachment_name"] = os.path.basename(f.filename)
-    write_conn(conn)
+    write_conn(st.email, conn)
     return jsonify({"ok": True, "name": os.path.basename(f.filename)})
 
 
 @app.post("/api/delete_attachment")
+@login_required
 def api_delete_attachment():
-    for old in workdir().glob(ATTACH_STEM + ".*"):
+    st = current_state()
+    for old in udir(st.email).glob(ATTACH_STEM + ".*"):
         old.unlink()
-    conn = read_conn()
+    conn = read_conn(st.email)
     conn.pop("attachment_name", None)
-    write_conn(conn)
+    write_conn(st.email, conn)
     return jsonify({"ok": True})
 
 
 @app.post("/api/preview")
+@login_required
 def api_preview():
+    st = current_state()
+    email = st.email
     data = request.get_json(force=True)
     template = data.get("template", "")
     which = data.get("which", "letter")
-    signature = data.get("signature")  # текущее содержимое поля подписи
+    signature = data.get("signature")
     count = int(data.get("count", 1))
 
     if which == "followup":
-        records = [r for r in load_state(state_file()) if r.status == "sent"]
+        records = [r for r in load_state(state_file(email)) if r.status == "sent"]
         items = [r.context_contact() for r in records[:count]]
         if not items:
             return jsonify({"ok": False, "error": "Нет данных о первой рассылке для предпросмотра."}), 400
     else:
-        items = SESSION["contacts"][:count]
+        items = st.contacts[:count]
         if not items:
             return jsonify({"ok": False, "error": "Сначала загрузите Excel."}), 400
 
@@ -671,82 +766,98 @@ def api_preview():
         if which == "followup" and not subject.lower().startswith("re:"):
             subject = f"RE: {subject}"
         body = render_template(template, c)
-        html = build_email_html(body, "/api/sigphoto", signature=signature)
+        html = build_email_html(email, body, "/api/sigphoto", signature=signature)
         result.append({"email": c.email, "subject": subject, "html": html})
     return jsonify({"ok": True, "items": result})
 
 
 @app.post("/api/send")
+@login_required
 def api_send():
+    st = current_state()
     data = request.get_json(force=True)
     template = data.get("template", "")
-    template_file("letter").write_text(template, encoding="utf-8")
+    template_file(st.email, "letter").write_text(template, encoding="utf-8")
     delay = float(data.get("delay", 1.0))
     limit = int(data.get("limit", 0))
     resume = bool(data.get("resume", False))
-    if start_job(worker_send, template, delay, limit, resume):
+    if start_job(st, worker_send, template, delay, limit, resume):
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "Уже выполняется другая задача."}), 409
 
 
 @app.post("/api/followup")
+@login_required
 def api_followup():
+    st = current_state()
     data = request.get_json(force=True)
     template = data.get("template", "")
-    template_file("followup").write_text(template, encoding="utf-8")
+    template_file(st.email, "followup").write_text(template, encoding="utf-8")
     delay = float(data.get("delay", 1.0))
     limit = int(data.get("limit", 0))
     only = data.get("only", "")
     skip_done = bool(data.get("skip_done", True))
-    if start_job(worker_followup, template, delay, limit, only, skip_done):
+    if start_job(st, worker_followup, template, delay, limit, only, skip_done):
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "Уже выполняется другая задача."}), 409
 
 
 @app.get("/api/status")
+@login_required
 def api_status():
-    with JOB_LOCK:
-        return jsonify(dict(JOB))
-
-
-# --------------------------------------------------------------------------- #
-# Корректное завершение: кнопка «Выход» + авто-остановка при закрытии браузера
-# --------------------------------------------------------------------------- #
-# Страница раз в несколько секунд шлёт «пинг». Если пингов нет дольше таймаута
-# (браузер закрыли) и сейчас не идёт рассылка — приложение само завершается.
-HEARTBEAT_TIMEOUT = float(os.environ.get("K2_MAILER_IDLE_TIMEOUT", "15"))
-LAST_BEAT = {"t": None}  # None = браузер ещё ни разу не подключался
+    st = current_state()
+    with st.job_lock:
+        return jsonify(dict(st.job))
 
 
 @app.post("/api/heartbeat")
 def api_heartbeat():
-    LAST_BEAT["t"] = time.time()
+    st = current_state()
+    if st:
+        st.last_beat = time.time()
     return jsonify({"ok": True})
 
 
+# --------------------------------------------------------------------------- #
+# Завершение/обслуживание
+# --------------------------------------------------------------------------- #
 def shutdown_now() -> None:
-    """Завершает процесс приложения (вместе с локальным сервером)."""
     def _exit():
-        time.sleep(0.4)  # дать отдать HTTP-ответ
+        time.sleep(0.4)
         os._exit(0)
     threading.Thread(target=_exit, daemon=True).start()
 
 
 @app.post("/api/quit")
 def api_quit():
+    # В серверном режиме «выход» = выход из учётной записи, а не остановка сервера.
+    if SERVER_MODE:
+        return api_logout()
     shutdown_now()
     return jsonify({"ok": True})
 
 
+def _any_job_running() -> bool:
+    with USERS_LOCK:
+        return any(s.job["running"] for s in USERS.values())
+
+
+def _last_beat() -> float | None:
+    with USERS_LOCK:
+        beats = [s.last_beat for s in USERS.values() if s.last_beat]
+    return max(beats) if beats else None
+
+
 def should_shutdown() -> bool:
-    """True, если браузер уже подключался, но давно молчит, и рассылка не идёт."""
-    last = LAST_BEAT["t"]
-    if last is None:
-        return False  # браузер ещё не подключался — не выключаемся
-    with JOB_LOCK:
-        if JOB["running"]:
-            return False  # идёт рассылка — не прерываем
-    return (time.time() - last) > HEARTBEAT_TIMEOUT
+    """Авто-остановка (только локальный режим): браузер закрыли и задач нет."""
+    if SERVER_MODE:
+        return False
+    lb = _last_beat()
+    if lb is None:
+        return False
+    if _any_job_running():
+        return False
+    return (time.time() - lb) > HEARTBEAT_TIMEOUT
 
 
 def watchdog() -> None:
@@ -755,6 +866,19 @@ def watchdog() -> None:
         if should_shutdown():
             shutdown_now()
             return
+
+
+def session_reaper() -> None:
+    """Серверный режим: выкидываем неактивные сессии (и пароли) из памяти."""
+    while True:
+        time.sleep(300)
+        now = time.time()
+        with USERS_LOCK:
+            dead = [uid for uid, s in USERS.items()
+                    if not s.job["running"] and s.last_beat
+                    and (now - s.last_beat) > SESSION_TTL]
+            for uid in dead:
+                USERS.pop(uid, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -772,9 +896,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   * { box-sizing: border-box; }
   body { margin:0; font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
          background:var(--bg); color:#1a202c; }
-  header { background:var(--pri2); color:#fff; padding:16px 24px; }
+  header { background:var(--pri2); color:#fff; padding:16px 24px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
   header h1 { margin:0; font-size:18px; }
   header .sub { opacity:.8; font-size:13px; }
+  header .who { font-size:13px; text-align:right; }
+  header .who button { margin-top:6px; }
   main { max-width:920px; margin:0 auto; padding:20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
           padding:18px 20px; margin-bottom:18px; }
@@ -819,20 +945,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>K2 Mailer — рассылка из рабочей почты</h1>
-  <div class="sub">Локально, на вашем компьютере. Письма уходят из вашего ящика OWA.</div>
+  <div>
+    <h1>K2 Mailer — рассылка из рабочей почты</h1>
+    <div class="sub">Письма уходят из вашего ящика OWA. Пароль хранится только в памяти сервера.</div>
+  </div>
+  <div class="who" id="whoBox" style="display:none">
+    <div>Вы вошли как <b id="whoEmail"></b></div>
+    <button class="secondary" id="btnLogout">Выйти</button>
+  </div>
 </header>
 <main>
 
-  <!-- 1. Подключение -->
-  <div class="card">
-    <h2><span class="step">1</span> Подключение к почте</h2>
+  <!-- Вход -->
+  <div class="card" id="loginCard">
+    <h2><span class="step">1</span> Вход в почтовый ящик</h2>
+    <div class="hint">Введите данные своей рабочей почты. Это и есть вход: приложение
+      подключается к Exchange под вашим логином. Пароль никуда не записывается.</div>
     <div class="row">
-      <div><label>Ваш email (отправитель)</label><input id="email" type="text" placeholder="ivanov@company.ru"></div>
-      <div><label>Логин (часто DOMAIN\\user, можно оставить пустым)</label><input id="username" type="text" placeholder="COMPANY\\ivanov"></div>
+      <div><label>Ваш email (отправитель)</label><input id="email" type="text" placeholder="ivanov@k2.cloud"></div>
+      <div><label>Логин (часто DOMAIN\\user, можно оставить пустым)</label><input id="username" type="text" placeholder="K2\\ivanov"></div>
     </div>
     <div class="row">
-      <div><label>Адрес EWS (пусто = автоопределение)</label><input id="ews_url" type="text" placeholder="https://mail.company.ru/EWS/Exchange.asmx"></div>
+      <div><label>Адрес EWS (можно оставить пустым)</label><input id="ews_url" type="text" placeholder="https://mail.k2.cloud/EWS/Exchange.asmx"></div>
       <div style="max-width:160px"><label>Аутентификация</label>
         <select id="auth_type"><option>NTLM</option><option>basic</option><option value="auto">auto</option></select>
       </div>
@@ -842,10 +976,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="inline"><input id="verify_ssl" type="checkbox" checked><label style="margin:0">Проверять SSL-сертификат (снимите только при самоподписанном)</label></div>
     <div class="btns">
-      <button id="btnConnect">Проверить подключение</button>
+      <button id="btnLogin">Войти</button>
     </div>
     <div id="connMsg" class="msg"></div>
   </div>
+
+  <!-- Рабочая область (доступна после входа) -->
+  <div id="appArea" style="display:none">
 
   <!-- 2. Контакты -->
   <div class="card">
@@ -934,19 +1071,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="hint" id="workdir"></div>
   <div class="btns" style="margin-top:8px">
     <button id="btnQuit" class="danger">Завершить работу</button>
-    <span class="hint" style="align-self:center">Сервер также сам остановится, если закрыть это окно браузера.</span>
+    <span class="hint" id="quitHint" style="align-self:center"></span>
   </div>
+
+  </div><!-- /appArea -->
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
+let SERVER_MODE = false;
 async function api(url, opts){ const r = await fetch(url, opts); return await r.json(); }
 async function postJSON(url, body){
   return api(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
 }
 function setMsg(el, text, ok){ el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err'); }
+function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-function collectConn(){
+function collectLogin(){
   return {
     email: $('email').value, username: $('username').value, ews_url: $('ews_url').value,
     auth_type: $('auth_type').value, verify_ssl: $('verify_ssl').checked,
@@ -954,17 +1095,47 @@ function collectConn(){
   };
 }
 
+async function boot(){
+  const me = await api('/api/me');
+  SERVER_MODE = !!me.server_mode;
+  if (me.authed){
+    showApp(me.email);
+    await loadConfig();
+  } else {
+    // не вошли — подставим значения по умолчанию для формы входа
+    const d = await api('/api/defaults');
+    $('ews_url').value = d.ews_url || '';
+    if (d.auth_type) $('auth_type').value = d.auth_type;
+    $('verify_ssl').checked = d.verify_ssl !== false;
+    showLogin();
+  }
+}
+
+function showLogin(){
+  $('appArea').style.display = 'none';
+  $('whoBox').style.display = 'none';
+  $('loginCard').style.display = '';
+}
+function showApp(email){
+  $('whoEmail').textContent = email;
+  $('whoBox').style.display = '';
+  $('appArea').style.display = '';
+  $('loginCard').style.display = 'none';
+  $('btnQuit').textContent = SERVER_MODE ? 'Выйти из учётной записи' : 'Завершить работу';
+  $('quitHint').textContent = SERVER_MODE
+    ? 'На сервере кнопка завершает только ваш сеанс, остальные продолжают работать.'
+    : 'Сервер также сам остановится, если закрыть это окно браузера.';
+}
+
 async function loadConfig(){
   const c = await api('/api/config');
-  $('email').value = c.email || ''; $('username').value = c.username || '';
-  $('ews_url').value = c.ews_url || ''; $('auth_type').value = c.auth_type || 'NTLM';
-  $('verify_ssl').checked = c.verify_ssl !== false;
+  if (c.email === undefined){ showLogin(); return; }
   $('letter').value = c.letter || ''; $('followup').value = c.followup || '';
   $('signature').value = c.signature || '';
   setPhotoPill(c.has_photo, c.photo_name);
   setAttachPill(c.has_attachment, c.attachment_name);
   $('contactsPill').textContent = c.contacts_count ? (c.contacts_count + ' контактов') : 'не загружено';
-  $('workdir').textContent = 'Данные и история хранятся в папке: ' + c.workdir;
+  $('workdir').textContent = 'Ваши данные и история хранятся в папке: ' + c.workdir;
   if (c.sent_count){
     let s = 'В истории отправки: ' + c.sent_count + ' получателей (доступно «дослать»).';
     if (c.followed_count) s += ' Из них повторное письмо уже получили: ' + c.followed_count + '.';
@@ -972,17 +1143,22 @@ async function loadConfig(){
   }
 }
 
-$('btnConnect').onclick = async () => {
-  setMsg($('connMsg'), 'Проверяю подключение…', true);
-  const r = await postJSON('/api/connect', collectConn());
-  setMsg($('connMsg'), r.ok ? r.message : ('Ошибка: ' + r.error), r.ok);
+$('btnLogin').onclick = async () => {
+  setMsg($('connMsg'), 'Вхожу…', true);
+  const r = await postJSON('/api/login', collectLogin());
+  if (r.ok){ $('password').value=''; showApp(r.email); await loadConfig(); }
+  else setMsg($('connMsg'), 'Ошибка: ' + r.error, false);
+};
+$('password').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnLogin').click(); });
+
+$('btnLogout').onclick = async () => {
+  await postJSON('/api/logout', {});
+  location.reload();
 };
 
 $('btnUpload').onclick = async () => {
   const f = $('file').files[0];
   if (!f){ setMsg($('uploadMsg'), 'Выберите файл .xlsx', false); return; }
-  // сохраним настройки колонок/подключения перед чтением
-  await postJSON('/api/save_settings', collectConn());
   const fd = new FormData(); fd.append('file', f);
   const r = await api('/api/upload', {method:'POST', body: fd});
   if (!r.ok){ setMsg($('uploadMsg'), 'Ошибка: ' + r.error, false); $('previewTable').innerHTML=''; return; }
@@ -999,9 +1175,8 @@ $('btnSaveTpl').onclick = async () => {
   setMsg($('jobStatus'), 'Шаблоны сохранены.', true);
 };
 
-function setPhotoPill(has, name){
-  $('photoPill').textContent = has ? ('фото: ' + (name || 'загружено')) : 'фото не загружено';
-}
+function setPhotoPill(has, name){ $('photoPill').textContent = has ? ('фото: ' + (name || 'загружено')) : 'фото не загружено'; }
+function setAttachPill(has, name){ $('attachPill').textContent = has ? ('PDF: ' + (name || 'прикреплён')) : 'PDF не прикреплён'; }
 
 $('btnSaveSig').onclick = async () => {
   await postJSON('/api/save_signature', {signature: $('signature').value});
@@ -1021,10 +1196,6 @@ $('btnDeletePhoto').onclick = async () => {
   await postJSON('/api/delete_photo', {});
   setPhotoPill(false, ''); setMsg($('sigMsg'), 'Фото убрано.', true);
 };
-
-function setAttachPill(has, name){
-  $('attachPill').textContent = has ? ('PDF: ' + (name || 'прикреплён')) : 'PDF не прикреплён';
-}
 
 $('btnUploadAttach').onclick = async () => {
   const f = $('attachfile').files[0];
@@ -1060,7 +1231,7 @@ function startPolling(){
     const j = await api('/api/status');
     const pct = j.total ? Math.round(j.done / j.total * 100) : 0;
     $('progBar').style.width = pct + '%';
-    $('log').textContent = j.log.join('\n');
+    $('log').textContent = (j.log||[]).join('\n');
     $('log').scrollTop = $('log').scrollHeight;
     let s = j.running ? `Выполняется (${j.done}/${j.total})…` : 'Готово.';
     if (j.sent || j.failed) s += `  Успешно: ${j.sent}, ошибок: ${j.failed}.`;
@@ -1068,13 +1239,10 @@ function startPolling(){
     if (j.finished && !j.running){ clearInterval(polling); polling = null; setButtons(false); }
   }, 1000);
 }
-function setButtons(running){
-  for (const id of ['btnSend','btnFollow']) $(id).disabled = running;
-}
+function setButtons(running){ for (const id of ['btnSend','btnFollow']) $(id).disabled = running; }
 
 $('btnSend').onclick = async () => {
   if (!confirm('Отправить рассылку всем загруженным контактам?')) return;
-  await postJSON('/api/save_settings', collectConn());
   await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/send', {
     template: $('letter').value, delay: +$('delay').value,
@@ -1090,7 +1258,6 @@ $('btnFollow').onclick = async () => {
     ? 'Дослать повторное письмо в ту же ветку? Тем, кому уже досылали, письмо повторно НЕ уйдёт.'
     : 'ВНИМАНИЕ: галочка защиты снята — повторное письмо уйдёт ВСЕМ, включая тех, кому уже досылали. Продолжить?';
   if (!confirm(warn)) return;
-  await postJSON('/api/save_settings', collectConn());
   await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/followup', {
     template: $('followup').value, delay: +$('delay').value, limit: +$('limit').value,
@@ -1100,20 +1267,24 @@ $('btnFollow').onclick = async () => {
   setButtons(true); $('log').textContent=''; startPolling();
 };
 
-function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-
-// «Пульс»: пока окно открыто, сервер живёт. Закрыли — сам остановится.
+// «Пульс» (нужен локальному режиму для авто-остановки при закрытии окна).
 function beat(){ fetch('/api/heartbeat', {method:'POST'}).catch(()=>{}); }
 beat(); setInterval(beat, 5000);
 
 $('btnQuit').onclick = async () => {
+  if (SERVER_MODE){
+    if (!confirm('Выйти из учётной записи?')) return;
+    try { await fetch('/api/quit', {method:'POST'}); } catch(e){}
+    location.reload();
+    return;
+  }
   if (!confirm('Завершить работу приложения? Локальный сервер остановится.')) return;
   try { await fetch('/api/quit', {method:'POST'}); } catch(e){}
   document.body.innerHTML = '<div style="padding:48px;font:16px -apple-system,sans-serif;color:#2d3748">'
     + 'Приложение остановлено. Эту вкладку можно закрыть.</div>';
 };
 
-loadConfig();
+boot();
 </script>
 </body>
 </html>
@@ -1121,7 +1292,6 @@ loadConfig();
 
 
 def pick_free_port(preferred: int) -> int:
-    """Возвращает свободный порт, начиная с preferred (вдруг старый экземпляр висит)."""
     for port in [preferred, *range(preferred + 1, preferred + 50)]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -1133,8 +1303,7 @@ def pick_free_port(preferred: int) -> int:
 
 
 def wait_and_open(url: str) -> None:
-    """Ждёт, пока сервер начнёт отвечать, затем открывает браузер."""
-    for _ in range(50):  # до ~10 секунд
+    for _ in range(50):
         try:
             urllib.request.urlopen(url, timeout=1).read()
             break
@@ -1147,7 +1316,6 @@ def wait_and_open(url: str) -> None:
 
 
 def show_error_dialog(message: str) -> None:
-    """Показывает нативное окно с ошибкой (чтобы сбой не выглядел как «ничего не происходит»)."""
     if sys.platform != "darwin":
         return
     safe = message.replace('"', "'").replace("\\", "/")
@@ -1162,21 +1330,36 @@ def show_error_dialog(message: str) -> None:
 
 
 def main() -> None:
-    logfile = workdir() / "app.log"
+    global PORT
+    logfile = base_dir() / "app.log"
     logging.basicConfig(
         filename=str(logfile), level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
-        global PORT
-        PORT = pick_free_port(PORT)
-        url = f"http://{HOST}:{PORT}"
-        logging.info("Запуск %s (рабочая папка %s)", url, workdir())
-        print(f"{APP_NAME} запущен. Откройте в браузере: {url}")
-        print(f"Рабочая папка: {workdir()}")
-        threading.Thread(target=wait_and_open, args=(url,), daemon=True).start()
-        threading.Thread(target=watchdog, daemon=True).start()
-        app.run(host=HOST, port=PORT, threaded=True)
+        if SERVER_MODE:
+            # Серверный режим: production-сервер, без браузера и авто-остановки.
+            url = f"http://{HOST}:{PORT}"
+            logging.info("Запуск в СЕРВЕРНОМ режиме %s (данные в %s)", url, base_dir())
+            print(f"{APP_NAME} (серверный режим) слушает {url}")
+            if not os.environ.get("K2_MAILER_SECRET"):
+                print("ВНИМАНИЕ: K2_MAILER_SECRET не задан — при перезапуске все входы "
+                      "сбросятся. Задайте постоянный секрет в окружении.")
+            threading.Thread(target=session_reaper, daemon=True).start()
+            try:
+                from waitress import serve
+            except ImportError:
+                raise MailerError("Не установлен waitress. Выполните: pip install waitress")
+            serve(app, host=HOST, port=PORT, threads=8, ident=APP_NAME)
+        else:
+            PORT = pick_free_port(PORT)
+            url = f"http://{HOST}:{PORT}"
+            logging.info("Запуск %s (данные в %s)", url, base_dir())
+            print(f"{APP_NAME} запущен. Откройте в браузере: {url}")
+            print(f"Папка данных: {base_dir()}")
+            threading.Thread(target=wait_and_open, args=(url,), daemon=True).start()
+            threading.Thread(target=watchdog, daemon=True).start()
+            app.run(host=HOST, port=PORT, threaded=True)
     except Exception as exc:
         logging.exception("Сбой при запуске")
         show_error_dialog(f"Не удалось запустить K2 Mailer:\n{exc}\n\nПодробности в файле:\n{logfile}")
