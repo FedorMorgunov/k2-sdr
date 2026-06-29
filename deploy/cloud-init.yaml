@@ -1,0 +1,59 @@
+#cloud-config
+# Автонастройка K2 Mailer при создании VM (поле «Пользовательские данные» в K2 Cloud).
+# Машина сама поставит зависимости, запустит сервис и поднимет HTTPS (самоподписанный
+# сертификат). SSH для запуска НЕ нужен.
+#
+# Перед вставкой замените ТРИ места ниже:
+#   1) ВАШ_GITHUB_ТОКЕН  — токен с правом read на репозиторий (Settings → Developer
+#      settings → Personal access tokens → fine-grained, доступ только к этому репо).
+#   2) mail.ЗАМЕНИТЕ/EWS/Exchange.asmx — адрес EWS вашего Exchange.
+#   3) (необязательно) свой публичный SSH-ключ в ssh_authorized_keys, если хотите
+#      потом заходить по ssh. Не нужно — удалите этот блок.
+
+package_update: true
+packages:
+  - git
+  - python3-venv
+  - python3-pip
+  - nginx
+  - openssl
+
+# --- (необязательно) доступ по SSH: вставьте содержимое вашего .pub ---
+ssh_authorized_keys:
+  - ssh-ed25519 AAAA_ВАШ_ПУБЛИЧНЫЙ_КЛЮЧ_ЗАМЕНИТЕ_ИЛИ_УДАЛИТЕ_ЭТОТ_БЛОК
+
+runcmd:
+  - |
+    set -ex
+    EWS_URL="https://mail.ЗАМЕНИТЕ/EWS/Exchange.asmx"
+    REPO="https://ВАШ_GITHUB_ТОКЕН@github.com/FedorMorgunov/k2-sdr.git"
+    BRANCH="claude/vigilant-goldberg-Hatwc"
+
+    git clone -b "$BRANCH" "$REPO" /opt/k2-sdr
+    K2_EWS_URL="$EWS_URL" bash /opt/k2-sdr/deploy/install.sh
+
+    # Самоподписанный сертификат (браузер предупредит — это нормально для теста)
+    mkdir -p /etc/ssl/k2
+    openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+      -keyout /etc/ssl/k2/k2.key -out /etc/ssl/k2/k2.crt -subj "/CN=k2-mailer"
+
+    cat > /etc/nginx/sites-available/k2-mailer <<'NG'
+    server { listen 80; return 301 https://$host$request_uri; }
+    server {
+      listen 443 ssl;
+      ssl_certificate     /etc/ssl/k2/k2.crt;
+      ssl_certificate_key /etc/ssl/k2/k2.key;
+      client_max_body_size 32m;
+      location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+      }
+    }
+    NG
+    ln -sf /etc/nginx/sites-available/k2-mailer /etc/nginx/sites-enabled/k2-mailer
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t && systemctl restart nginx
