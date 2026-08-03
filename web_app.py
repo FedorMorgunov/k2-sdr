@@ -407,7 +407,8 @@ def worker_send(st: UserState, template: str, delay: float, limit: int, resume: 
 
 
 def worker_followup(st: UserState, template: str, delay: float, limit: int,
-                    only: str, skip_done: bool = True) -> None:
+                    only: str, skip_done: bool = True,
+                    only_current: bool = True) -> None:
     email = st.email
     try:
         cfg = current_config(st)
@@ -419,6 +420,24 @@ def worker_followup(st: UserState, template: str, delay: float, limit: int,
             raise MailerError("Нет данных о первой рассылке. Сначала выполните рассылку.")
 
         targets = [r for r in records if r.status == "sent"]
+
+        # Ограничиваем ЗАГРУЖЕННЫМ СЕЙЧАС списком. История отправки накапливается по
+        # всем прошлым рассылкам, поэтому без этого фильтра повторное письмо ушло бы
+        # вообще всем, кому когда-либо писали из этой программы.
+        if only_current:
+            current = {c.email.lower() for c in st.contacts}
+            if not current:
+                raise MailerError(
+                    "Сначала загрузите Excel со списком — повторные письма уходят "
+                    "только тем, кто есть в загруженном списке. Чтобы дослать всем "
+                    "из истории отправки, снимите галочку «Только загруженный список»."
+                )
+            before = len(targets)
+            targets = [r for r in targets if r.email.lower() in current]
+            ignored = before - len(targets)
+            if ignored:
+                job_log(st, f"Не входят в загруженный список (пропущены): {ignored}")
+
         if only.strip():
             wanted = {e.strip().lower() for e in only.split(",") if e.strip()}
             targets = [r for r in targets if r.email.lower() in wanted]
@@ -429,11 +448,15 @@ def worker_followup(st: UserState, template: str, delay: float, limit: int,
             if skipped:
                 job_log(st, f"Пропущено уже досланных (им повторное письмо уже уходило): {skipped}")
         if not targets:
-            raise MailerError("Нет адресатов для повторного письма: либо нет успешной "
-                              "первой рассылки, либо всем уже дослали. Чтобы отправить "
-                              "повторно намеренно — снимите галочку «Не досылать повторно».")
+            raise MailerError("Нет адресатов для повторного письма: из загруженного списка "
+                              "либо никому не отправляли первое письмо, либо всем уже дослали. "
+                              "Чтобы отправить повторно намеренно — снимите галочку "
+                              "«Не досылать повторно».")
         if limit > 0:
             targets = targets[:limit]
+
+        job_log(st, f"Адресатов повторного письма: {len(targets)}"
+                    + (" (из загруженного списка)" if only_current else " (из всей истории отправки)"))
 
         attachments = attachment_for_send(email)
 
@@ -752,9 +775,15 @@ def api_preview():
 
     if which == "followup":
         records = [r for r in load_state(state_file(email)) if r.status == "sent"]
+        # Предпросмотр показываем по загруженному списку — как и уходит рассылка.
+        current = {c.email.lower() for c in st.contacts}
+        if current:
+            records = [r for r in records if r.email.lower() in current]
         items = [r.context_contact() for r in records[:count]]
         if not items:
-            return jsonify({"ok": False, "error": "Нет данных о первой рассылке для предпросмотра."}), 400
+            return jsonify({"ok": False, "error": "Нет адресатов для предпросмотра: из "
+                                                  "загруженного списка первое письмо ещё "
+                                                  "никому не отправлено."}), 400
     else:
         items = st.contacts[:count]
         if not items:
@@ -797,7 +826,8 @@ def api_followup():
     limit = int(data.get("limit", 0))
     only = data.get("only", "")
     skip_done = bool(data.get("skip_done", True))
-    if start_job(st, worker_followup, template, delay, limit, only, skip_done):
+    only_current = bool(data.get("only_current", True))
+    if start_job(st, worker_followup, template, delay, limit, only, skip_done, only_current):
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "Уже выполняется другая задача."}), 409
 
@@ -1057,12 +1087,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="inline"><input id="resume" type="checkbox" checked><label style="margin:0">Пропускать уже отправленные (для рассылки)</label></div>
     <div class="inline"><input id="skipdone" type="checkbox" checked><label style="margin:0">Не досылать повторно тем, кому уже дослали (защита от двойной отправки)</label></div>
+    <div class="inline"><input id="onlycurrent" type="checkbox" checked><label style="margin:0">Только загруженный список (не трогать остальных из истории)</label></div>
     <div class="btns">
       <button id="btnSend">Отправить рассылку</button>
       <button id="btnFollow" class="secondary">Дослать в ту же ветку</button>
     </div>
-    <div class="hint">Повторное письмо уходит тем, кому первая рассылка прошла успешно (данные берутся из истории отправки).
-      Кому уже досылали — отмечается в истории, поэтому повторный клик не отправит письмо второй раз.</div>
+    <div class="hint">Повторное письмо уходит тем, кто есть <b>в загруженном сейчас Excel</b> и кому первая рассылка
+      прошла успешно. Остальные адресаты из истории не затрагиваются. Кому уже досылали — отмечается в истории,
+      поэтому повторный клик не отправит письмо второй раз.</div>
     <div class="bar"><i id="progBar"></i></div>
     <div id="jobStatus" class="msg"></div>
     <div class="log" id="log"></div>
@@ -1254,14 +1286,18 @@ $('btnSend').onclick = async () => {
 
 $('btnFollow').onclick = async () => {
   const skipDone = $('skipdone').checked;
-  const warn = skipDone
-    ? 'Дослать повторное письмо в ту же ветку? Тем, кому уже досылали, письмо повторно НЕ уйдёт.'
-    : 'ВНИМАНИЕ: галочка защиты снята — повторное письмо уйдёт ВСЕМ, включая тех, кому уже досылали. Продолжить?';
+  const onlyCurrent = $('onlycurrent').checked;
+  let warn = onlyCurrent
+    ? 'Дослать повторное письмо только тем, кто есть в загруженном сейчас Excel-списке?'
+    : 'ВНИМАНИЕ: снята галочка «Только загруженный список» — письмо уйдёт ВСЕМ адресатам из истории отправки, включая прошлые рассылки. Продолжить?';
+  warn += skipDone
+    ? '\n\nТем, кому уже досылали, письмо повторно НЕ уйдёт.'
+    : '\n\nВНИМАНИЕ: снята защита от двойной отправки — письмо уйдёт и тем, кому уже досылали.';
   if (!confirm(warn)) return;
   await postJSON('/api/save_signature', {signature: $('signature').value});
   const r = await postJSON('/api/followup', {
     template: $('followup').value, delay: +$('delay').value, limit: +$('limit').value,
-    only: '', skip_done: skipDone,
+    only: '', skip_done: skipDone, only_current: onlyCurrent,
   });
   if (!r.ok){ setMsg($('jobStatus'), 'Ошибка: ' + r.error, false); return; }
   setButtons(true); $('log').textContent=''; startPolling();

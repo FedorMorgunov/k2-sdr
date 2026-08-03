@@ -484,6 +484,18 @@ def cmd_followup(args) -> None:
     # Кому досылаем: успешно отправленным в первой рассылке.
     targets = [r for r in records if r.status == "sent"]
 
+    # Ограничение списком из Excel. История отправки накапливается по всем прошлым
+    # рассылкам, поэтому без --excel повторное письмо уйдёт всем, кому когда-либо
+    # писали. Указывайте тот же файл, что и в команде send.
+    if args.excel:
+        _cfg2, cols = load_config(Path(args.config))
+        current = {c.email.lower() for c in read_contacts(Path(args.excel), cols)}
+        before = len(targets)
+        targets = [r for r in targets if r.email.lower() in current]
+        ignored = before - len(targets)
+        if ignored:
+            print(f"Не входят в список {args.excel} (пропущены): {ignored}")
+
     if args.only:
         wanted = {e.strip().lower() for e in args.only.split(",") if e.strip()}
         targets = [r for r in targets if r.email.lower() in wanted]
@@ -611,6 +623,8 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("followup", parents=[common], help="Повторное письмо в ту же ветку")
     f.add_argument("--only", default="",
                    help="Слать только указанным адресам (через запятую)")
+    f.add_argument("--excel", default="",
+                   help="Дослать только адресатам из этого Excel (иначе — всем из истории)")
     f.add_argument("--attach", default="",
                    help="Путь к файлу-вложению (например, презентация в PDF)")
     f.add_argument("--resend", action="store_true",
